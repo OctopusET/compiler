@@ -34,15 +34,15 @@ impl PathRegistry {
     pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> String {
         let (group, filename) = get_group_and_filename(law_name, law_type);
         let base = format!("{group}/{filename}.md");
-        if let Some(existing) = self.assigned.get(&base) {
-            if existing != &(law_name.to_owned(), law_type.to_owned()) {
-                let qualified = format!("{group}/{filename}({law_type}).md");
-                self.assigned.insert(
-                    qualified.clone(),
-                    (law_name.to_owned(), law_type.to_owned()),
-                );
-                return qualified;
-            }
+        if let Some(existing) = self.assigned.get(&base)
+            && existing != &(law_name.to_owned(), law_type.to_owned())
+        {
+            let qualified = format!("{group}/{filename}({law_type}).md");
+            self.assigned.insert(
+                qualified.clone(),
+                (law_name.to_owned(), law_type.to_owned()),
+            );
+            return qualified;
         }
 
         self.assigned
@@ -184,20 +184,20 @@ fn articles_to_markdown(articles: &[Article]) -> String {
         let title = &article.title;
         let content = normalize_law_name(article.content.trim());
 
-        if title.is_empty() {
-            if let Some(captures) = structure_re().captures(&content) {
-                let level = match captures.get(1).map(|m| m.as_str()) {
-                    Some("편") => "#",
-                    Some("장") => "##",
-                    Some("절") => "###",
-                    Some("관") => "####",
-                    _ => "",
-                };
-                if !level.is_empty() {
-                    lines.push(format!("{level} {content}"));
-                    lines.push(String::new());
-                    continue;
-                }
+        if title.is_empty()
+            && let Some(captures) = structure_re().captures(&content)
+        {
+            let level = match captures.get(1).map(|m| m.as_str()) {
+                Some("편") => "#",
+                Some("장") => "##",
+                Some("절") => "###",
+                Some("관") => "####",
+                _ => "",
+            };
+            if !level.is_empty() {
+                lines.push(format!("{level} {content}"));
+                lines.push(String::new());
+                continue;
             }
         }
 

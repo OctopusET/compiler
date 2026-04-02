@@ -153,11 +153,11 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
             }
             Event::End(event) => {
                 let tag = decode_name(event.name().as_ref())?;
-                if let Some(current) = &capture_tag {
-                    if current == &tag {
-                        assign_metadata_field(&mut metadata, current, &capture_text);
-                        capture_tag = None;
-                    }
+                if let Some(current) = &capture_tag
+                    && current == &tag
+                {
+                    assign_metadata_field(&mut metadata, current, &capture_text);
+                    capture_tag = None;
                 }
                 if tag == "기본정보" {
                     break;
