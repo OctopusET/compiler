@@ -1,0 +1,405 @@
+use anyhow::{Context, Result};
+use quick_xml::Reader;
+use quick_xml::escape::unescape;
+use quick_xml::events::Event;
+
+#[derive(Debug, Clone, Default)]
+pub struct LawMetadata {
+    pub mst: String,
+    pub law_name: String,
+    pub law_id: String,
+    pub law_type: String,
+    pub law_type_code: String,
+    pub department_name: String,
+    pub promulgation_date: String,
+    pub promulgation_number: String,
+    pub enforcement_date: String,
+    pub amendment: String,
+    pub field: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Item {
+    pub number: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Subparagraph {
+    pub number: String,
+    pub content: String,
+    pub items: Vec<Item>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Paragraph {
+    pub number: String,
+    pub content: String,
+    pub subparagraphs: Vec<Subparagraph>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Article {
+    pub number: String,
+    pub title: String,
+    pub content: String,
+    pub paragraphs: Vec<Paragraph>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Addendum {
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LawDetail {
+    pub metadata: LawMetadata,
+    pub articles: Vec<Article>,
+    pub addenda: Vec<Addendum>,
+}
+
+#[derive(Debug, Clone)]
+struct XmlNode {
+    name: String,
+    text: String,
+    children: Vec<XmlNode>,
+}
+
+impl XmlNode {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            text: String::new(),
+            children: Vec::new(),
+        }
+    }
+
+    fn child_text(&self, name: &str) -> String {
+        self.children
+            .iter()
+            .find(|child| child.name == name)
+            .map(|child| child.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn descendant_text(&self, name: &str) -> String {
+        if self.name == name {
+            return self.text.clone();
+        }
+
+        for child in &self.children {
+            let value = child.descendant_text(name);
+            if !value.is_empty() {
+                return value;
+            }
+        }
+
+        String::new()
+    }
+
+    fn collect_descendants<'a>(&'a self, name: &str, out: &mut Vec<&'a XmlNode>) {
+        if self.name == name {
+            out.push(self);
+        }
+        for child in &self.children {
+            child.collect_descendants(name, out);
+        }
+    }
+}
+
+pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut buf = Vec::new();
+    let mut capture_tag: Option<String> = None;
+    let mut capture_text = String::new();
+    let mut in_basic_info = false;
+    let mut metadata = LawMetadata {
+        mst: mst.to_owned(),
+        law_id: String::new(),
+        law_type_code: String::new(),
+        amendment: String::new(),
+        ..LawMetadata::default()
+    };
+
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(event) => {
+                let tag = decode_name(event.name().as_ref())?;
+                if tag == "기본정보" {
+                    in_basic_info = true;
+                }
+                if in_basic_info && should_capture_metadata_tag(&tag, &metadata) {
+                    capture_text.clear();
+                    capture_tag = Some(tag);
+                }
+            }
+            Event::Empty(event) => {
+                let tag = decode_name(event.name().as_ref())?;
+                if tag == "기본정보" {
+                    break;
+                }
+            }
+            Event::Text(text) => {
+                if capture_tag.is_some() {
+                    capture_text.push_str(&decode_text(text.as_ref())?);
+                }
+            }
+            Event::CData(text) => {
+                if capture_tag.is_some() {
+                    capture_text.push_str(&String::from_utf8_lossy(text.as_ref()));
+                }
+            }
+            Event::End(event) => {
+                let tag = decode_name(event.name().as_ref())?;
+                if let Some(current) = &capture_tag {
+                    if current == &tag {
+                        assign_metadata_field(&mut metadata, current, &capture_text);
+                        capture_tag = None;
+                    }
+                }
+                if tag == "기본정보" {
+                    break;
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(metadata)
+}
+
+pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
+    let root = parse_xml_tree(xml)?;
+    let mut detail = LawDetail {
+        metadata: LawMetadata {
+            mst: mst.to_owned(),
+            law_name: root.descendant_text("법령명_한글"),
+            law_id: root.descendant_text("법령ID"),
+            law_type: root.descendant_text("법종구분"),
+            law_type_code: root.descendant_text("법종구분코드"),
+            department_name: root.descendant_text("소관부처명"),
+            promulgation_date: root.descendant_text("공포일자"),
+            promulgation_number: root.descendant_text("공포번호"),
+            enforcement_date: root.descendant_text("시행일자"),
+            amendment: root.descendant_text("제개정구분명"),
+            field: root.descendant_text("법령분류명"),
+        },
+        articles: Vec::new(),
+        addenda: Vec::new(),
+    };
+
+    let mut article_nodes = Vec::new();
+    root.collect_descendants("조문단위", &mut article_nodes);
+    for node in article_nodes {
+        let mut article = Article {
+            number: node.child_text("조문번호"),
+            title: node.child_text("조문제목"),
+            content: node.child_text("조문내용"),
+            paragraphs: Vec::new(),
+        };
+
+        let mut paragraph_nodes = Vec::new();
+        node.collect_descendants("항", &mut paragraph_nodes);
+        for paragraph_node in paragraph_nodes {
+            let mut paragraph = Paragraph {
+                number: paragraph_node.child_text("항번호"),
+                content: paragraph_node.child_text("항내용"),
+                subparagraphs: Vec::new(),
+            };
+
+            let mut subparagraph_nodes = Vec::new();
+            paragraph_node.collect_descendants("호", &mut subparagraph_nodes);
+            for subparagraph_node in subparagraph_nodes {
+                let mut subparagraph = Subparagraph {
+                    number: subparagraph_node.child_text("호번호"),
+                    content: subparagraph_node.child_text("호내용"),
+                    items: Vec::new(),
+                };
+
+                let mut item_nodes = Vec::new();
+                subparagraph_node.collect_descendants("목", &mut item_nodes);
+                for item_node in item_nodes {
+                    subparagraph.items.push(Item {
+                        number: item_node.child_text("목번호"),
+                        content: item_node.child_text("목내용"),
+                    });
+                }
+
+                paragraph.subparagraphs.push(subparagraph);
+            }
+
+            article.paragraphs.push(paragraph);
+        }
+
+        detail.articles.push(article);
+    }
+
+    let mut addendum_nodes = Vec::new();
+    root.collect_descendants("부칙단위", &mut addendum_nodes);
+    for node in addendum_nodes {
+        detail.addenda.push(Addendum {
+            content: node.child_text("부칙내용"),
+        });
+    }
+
+    Ok(detail)
+}
+
+fn should_capture_metadata_tag(tag: &str, metadata: &LawMetadata) -> bool {
+    match tag {
+        "법령명_한글" => metadata.law_name.is_empty(),
+        "법령ID" => metadata.law_id.is_empty(),
+        "법종구분" => metadata.law_type.is_empty(),
+        "공포일자" => metadata.promulgation_date.is_empty(),
+        "공포번호" => metadata.promulgation_number.is_empty(),
+        "시행일자" => metadata.enforcement_date.is_empty(),
+        "소관부처명" => metadata.department_name.is_empty(),
+        "법령분류명" => metadata.field.is_empty(),
+        _ => false,
+    }
+}
+
+fn assign_metadata_field(metadata: &mut LawMetadata, tag: &str, value: &str) {
+    match tag {
+        "법령명_한글" => metadata.law_name = value.to_owned(),
+        "법령ID" => metadata.law_id = value.to_owned(),
+        "법종구분" => metadata.law_type = value.to_owned(),
+        "공포일자" => metadata.promulgation_date = value.to_owned(),
+        "공포번호" => metadata.promulgation_number = value.to_owned(),
+        "시행일자" => metadata.enforcement_date = value.to_owned(),
+        "소관부처명" => metadata.department_name = value.to_owned(),
+        "법령분류명" => metadata.field = value.to_owned(),
+        _ => {}
+    }
+}
+
+fn parse_xml_tree(xml: &[u8]) -> Result<XmlNode> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut buf = Vec::new();
+    let mut stack: Vec<XmlNode> = Vec::new();
+    let mut root = None;
+
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(event) => {
+                let name = decode_name(event.name().as_ref())?;
+                stack.push(XmlNode::new(name));
+            }
+            Event::Empty(event) => {
+                let name = decode_name(event.name().as_ref())?;
+                let node = XmlNode::new(name);
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(node);
+                } else {
+                    root = Some(node);
+                }
+            }
+            Event::Text(text) => {
+                if let Some(node) = stack.last_mut() {
+                    node.text.push_str(&decode_text(text.as_ref())?);
+                }
+            }
+            Event::CData(text) => {
+                if let Some(node) = stack.last_mut() {
+                    node.text.push_str(&String::from_utf8_lossy(text.as_ref()));
+                }
+            }
+            Event::End(_) => {
+                let node = stack.pop().context("unexpected end tag")?;
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(node);
+                } else {
+                    root = Some(node);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    root.context("missing XML root")
+}
+
+fn decode_name(name: &[u8]) -> Result<String> {
+    Ok(std::str::from_utf8(name)?.to_owned())
+}
+
+fn decode_text(text: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(text)?;
+    Ok(unescape(text)?.into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_metadata_only_like_python_search_path() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<법령>
+  <기본정보>
+    <법령ID>001566</법령ID>
+    <공포일자>19971213</공포일자>
+    <공포번호>05453</공포번호>
+    <법종구분>법률</법종구분>
+    <법령명_한글><![CDATA[주세법]]></법령명_한글>
+    <시행일자>19980101</시행일자>
+    <연락부서><부서단위><소관부처명>재정경제부</소관부처명></부서단위></연락부서>
+  </기본정보>
+</법령>"#;
+
+        let metadata = parse_metadata_only(xml.as_bytes(), "5848").unwrap();
+        assert_eq!(metadata.law_name, "주세법");
+        assert_eq!(metadata.law_type, "법률");
+        assert_eq!(metadata.department_name, "재정경제부");
+        assert_eq!(metadata.mst, "5848");
+    }
+
+    #[test]
+    fn parses_articles_paragraphs_and_items() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<법령>
+  <기본정보>
+    <법령ID>1</법령ID>
+    <법종구분>법률</법종구분>
+    <법령명_한글><![CDATA[테스트법]]></법령명_한글>
+  </기본정보>
+  <조문>
+    <조문단위>
+      <조문번호>1</조문번호>
+      <조문제목><![CDATA[정의]]></조문제목>
+      <조문내용><![CDATA[제1조 (정의) 정의한다.]]></조문내용>
+      <항>
+        <항번호><![CDATA[①]]></항번호>
+        <항내용><![CDATA[①첫 문장]]></항내용>
+        <호>
+          <호번호><![CDATA[1.]]></호번호>
+          <호내용><![CDATA[1.  첫 호]]></호내용>
+          <목>
+            <목번호><![CDATA[가.]]></목번호>
+            <목내용><![CDATA[가.  첫 목]]></목내용>
+          </목>
+        </호>
+      </항>
+    </조문단위>
+  </조문>
+</법령>"#;
+
+        let detail = parse_law_detail(xml.as_bytes(), "1").unwrap();
+        assert_eq!(detail.articles.len(), 1);
+        assert_eq!(detail.articles[0].paragraphs.len(), 1);
+        assert_eq!(detail.articles[0].paragraphs[0].subparagraphs.len(), 1);
+        assert_eq!(
+            detail.articles[0].paragraphs[0].subparagraphs[0]
+                .items
+                .len(),
+            1
+        );
+    }
+}
