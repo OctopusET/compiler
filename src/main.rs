@@ -78,15 +78,7 @@ fn run(cli: Cli) -> Result<()> {
         let readme = fs::read(readme_path)
             .with_context(|| format!("failed to read {}", readme_path.display()))?;
         // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
-        repo.commit_static(
-            "README.md",
-            &readme,
-            "initial commit",
-            "Junghwan Park",
-            "reserve.dev@gmail.com",
-            1_774_839_600,
-            540,
-        )?;
+        repo.commit_static("README.md", &readme, "initial commit", 1_774_839_600, 540)?;
         eprintln!("  committed README.md");
     }
 

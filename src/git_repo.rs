@@ -9,6 +9,11 @@ use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 const MAIN_REF: &str = "refs/heads/main";
 const BOT_NAME: &str = "legalize-kr-bot";
 const BOT_EMAIL: &str = "bot@legalize.kr";
+const INITIAL_COMMIT_AUTHOR_NAME: &str = "Junghwan Park";
+const INITIAL_COMMIT_AUTHOR_EMAIL: &str = "reserve.dev@gmail.com";
+const INITIAL_COMMIT_COMMITTER_NAME: &str = "Jihyeon Kim";
+const INITIAL_COMMIT_COMMITTER_EMAIL: &str = "simnalamburt@gmail.com";
+const INITIAL_COMMIT_CO_AUTHORS: &[(&str, &str)] = &[("Jihyeon Kim", "simnalamburt@gmail.com")];
 const KST_OFFSET_MINUTES: i32 = 9 * 60;
 
 pub struct BareRepoWriter {
@@ -94,8 +99,6 @@ impl BareRepoWriter {
         path: &str,
         content: &[u8],
         message: &str,
-        author_name: &str,
-        author_email: &str,
         epoch: i64,
         offset_minutes: i32,
     ) -> Result<git2::Oid> {
@@ -110,8 +113,17 @@ impl BareRepoWriter {
         let tree = self.repo.find_tree(tree_oid)?;
 
         let time = GitTime::new(epoch, offset_minutes);
-        let author = Signature::new(author_name, author_email, &time)?;
-        let committer = Signature::new(author_name, author_email, &time)?;
+        let author = Signature::new(
+            INITIAL_COMMIT_AUTHOR_NAME,
+            INITIAL_COMMIT_AUTHOR_EMAIL,
+            &time,
+        )?;
+        let committer = Signature::new(
+            INITIAL_COMMIT_COMMITTER_NAME,
+            INITIAL_COMMIT_COMMITTER_EMAIL,
+            &time,
+        )?;
+        let message = append_co_author_trailers(message, INITIAL_COMMIT_CO_AUTHORS);
 
         let parent_commits = self
             .parent_commit
@@ -125,7 +137,7 @@ impl BareRepoWriter {
             Some(MAIN_REF),
             &author,
             &committer,
-            message,
+            &message,
             &tree,
             &parent_refs,
         )?;
@@ -148,6 +160,26 @@ impl BareRepoWriter {
         })?;
         Ok(())
     }
+}
+
+fn append_co_author_trailers(message: &str, co_authors: &[(&str, &str)]) -> String {
+    if co_authors.is_empty() {
+        return message.to_owned();
+    }
+
+    let mut rendered = String::from(message.trim_end());
+    rendered.push_str("\n\n");
+    for (index, (name, email)) in co_authors.iter().enumerate() {
+        if index > 0 {
+            rendered.push('\n');
+        }
+        rendered.push_str("Co-authored-by: ");
+        rendered.push_str(name);
+        rendered.push_str(" <");
+        rendered.push_str(email);
+        rendered.push('>');
+    }
+    rendered
 }
 
 fn make_temp_output_path(output: &Path) -> Result<PathBuf> {
