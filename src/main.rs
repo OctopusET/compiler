@@ -160,18 +160,22 @@ fn run_alternative(
     let total = entries.len();
     let mut committed = 0;
 
+    let mut skipped = 0usize;
+
     for chunk in entries.chunks(CHUNK_SIZE) {
         /* Parse + render in parallel */
-        let rendered: Vec<Option<Rendered>> = chunk
+        let rendered: Vec<Result<Rendered>> = chunk
             .par_iter()
             .map(|entry| {
                 let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
-                let xml = fs::read(&xml_path).ok()?;
-                let mut detail = parse_law_detail(&xml, &entry.mst).ok()?;
+                let xml = fs::read(&xml_path)
+                    .with_context(|| format!("failed to read {}", xml_path.display()))?;
+                let mut detail = parse_law_detail(&xml, &entry.mst)
+                    .with_context(|| format!("failed to parse MST {}", entry.mst))?;
                 detail.metadata.amendment = entry.metadata.amendment.clone();
-                let markdown = law_to_markdown(&detail).ok()?;
+                let markdown = law_to_markdown(&detail)?;
                 let message = build_commit_message(&detail.metadata, &entry.mst);
-                Some(Rendered {
+                Ok(Rendered {
                     path: entry.path.clone(),
                     markdown,
                     message,
@@ -181,13 +185,25 @@ fn run_alternative(
             .collect();
 
         /* Commit sequentially in order */
-        for r in rendered.into_iter().flatten() {
-            repo.commit_law(&r.path, &r.markdown, &r.message, &r.promulgation_date)?;
-            committed += 1;
-            if committed % 500 == 0 || committed == total {
-                eprintln!("  committed {committed}/{total}");
+        for r in rendered {
+            match r {
+                Ok(r) => {
+                    repo.commit_law(&r.path, &r.markdown, &r.message, &r.promulgation_date)?;
+                    committed += 1;
+                    if committed % 500 == 0 || committed == total {
+                        eprintln!("  committed {committed}/{total}");
+                    }
+                }
+                Err(e) => {
+                    skipped += 1;
+                    eprintln!("  WARN: {e:#}");
+                }
             }
         }
+    }
+
+    if skipped > 0 {
+        eprintln!("  skipped {skipped} entries due to errors");
     }
 
     repo.finish()?;
