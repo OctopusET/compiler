@@ -25,6 +25,10 @@ struct Cli {
     /// Output bare repository path
     #[arg(short = 'o', long = "output", default_value = "output.git")]
     output: PathBuf,
+
+    /// Path to README.md to include in the repository
+    #[arg(long = "readme")]
+    readme: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +73,22 @@ fn run(cli: Cli) -> Result<()> {
         cli.output.display()
     );
     let mut repo = BareRepoWriter::create(&cli.output)?;
+
+    if let Some(readme_path) = &cli.readme {
+        let readme = fs::read(readme_path)
+            .with_context(|| format!("failed to read {}", readme_path.display()))?;
+        // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
+        repo.commit_static(
+            "README.md",
+            &readme,
+            "initial commit",
+            "Junghwan Park",
+            "reserve.dev@gmail.com",
+            1_774_839_600,
+            540,
+        )?;
+        eprintln!("  committed README.md");
+    }
 
     for (index, entry) in entries.iter().enumerate() {
         let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
@@ -304,11 +324,11 @@ mod tests {
         let entries = plan_entries(&detail_dir, &history).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].mst, "1");
-        assert_eq!(entries[0].path, "테스트법/법률.md");
+        assert_eq!(entries[0].path, "kr/테스트법/법률.md");
         assert_eq!(entries[1].mst, "2");
-        assert_eq!(entries[1].path, "테스트법/법률.md");
+        assert_eq!(entries[1].path, "kr/테스트법/법률.md");
         assert_eq!(entries[2].mst, "10");
-        assert_eq!(entries[2].path, "테스트법/시행령.md");
+        assert_eq!(entries[2].path, "kr/테스트법/시행령.md");
     }
 
     #[test]
@@ -331,6 +351,7 @@ mod tests {
         run(Cli {
             cache_dir,
             output: output.clone(),
+            readme: None,
         })
         .unwrap();
 

@@ -89,6 +89,52 @@ impl BareRepoWriter {
         Ok(commit_oid)
     }
 
+    pub fn commit_static(
+        &mut self,
+        path: &str,
+        content: &[u8],
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+        epoch: i64,
+        offset_minutes: i32,
+    ) -> Result<git2::Oid> {
+        let blob_oid = self.repo.blob(content)?;
+        let path_parts = split_path(path)?;
+
+        let base_tree = self
+            .current_tree
+            .map(|oid| self.repo.find_tree(oid))
+            .transpose()?;
+        let tree_oid = upsert_path(&self.repo, base_tree.as_ref(), &path_parts, blob_oid)?;
+        let tree = self.repo.find_tree(tree_oid)?;
+
+        let time = GitTime::new(epoch, offset_minutes);
+        let author = Signature::new(author_name, author_email, &time)?;
+        let committer = Signature::new(author_name, author_email, &time)?;
+
+        let parent_commits = self
+            .parent_commit
+            .map(|oid| self.repo.find_commit(oid))
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<Commit>>();
+        let parent_refs = parent_commits.iter().collect::<Vec<&Commit>>();
+
+        let commit_oid = self.repo.commit(
+            Some(MAIN_REF),
+            &author,
+            &committer,
+            message,
+            &tree,
+            &parent_refs,
+        )?;
+
+        self.parent_commit = Some(commit_oid);
+        self.current_tree = Some(tree_oid);
+        Ok(commit_oid)
+    }
+
     pub fn finish(self) -> Result<()> {
         if self.final_output.exists() {
             remove_path(&self.final_output)?;

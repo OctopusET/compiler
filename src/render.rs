@@ -33,11 +33,11 @@ pub struct PathRegistry {
 impl PathRegistry {
     pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> String {
         let (group, filename) = get_group_and_filename(law_name, law_type);
-        let base = format!("{group}/{filename}.md");
+        let base = format!("kr/{group}/{filename}.md");
         if let Some(existing) = self.assigned.get(&base)
             && existing != &(law_name.to_owned(), law_type.to_owned())
         {
-            let qualified = format!("{group}/{filename}({law_type}).md");
+            let qualified = format!("kr/{group}/{filename}({law_type}).md");
             self.assigned.insert(
                 qualified.clone(),
                 (law_name.to_owned(), law_type.to_owned()),
@@ -398,11 +398,11 @@ mod tests {
         let mut registry = PathRegistry::default();
         assert_eq!(
             registry.get_law_path("테스트법 시행규칙", "부령"),
-            "테스트법/시행규칙.md"
+            "kr/테스트법/시행규칙.md"
         );
         assert_eq!(
             registry.get_law_path("테스트법 시행규칙", "총리령"),
-            "테스트법/시행규칙(총리령).md"
+            "kr/테스트법/시행규칙(총리령).md"
         );
     }
 
