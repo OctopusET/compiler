@@ -1,4 +1,5 @@
 mod git_repo;
+mod pack_repo;
 mod render;
 mod xml_parser;
 
@@ -12,6 +13,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 use crate::git_repo::BareRepoWriter;
+use crate::pack_repo::PackRepoWriter;
 use crate::render::{PathRegistry, build_commit_message, law_to_markdown};
 use crate::xml_parser::{LawMetadata, parse_law_detail, parse_metadata_only};
 
@@ -29,6 +31,10 @@ struct Cli {
     /// Path to README.md to include in the repository
     #[arg(long = "readme")]
     readme: Option<PathBuf>,
+
+    /// Use alternative packfile writer instead of libgit2
+    #[arg(long = "alternative")]
+    alternative: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,12 +78,28 @@ fn run(cli: Cli) -> Result<()> {
         entries.len(),
         cli.output.display()
     );
-    let mut repo = BareRepoWriter::create(&cli.output)?;
 
-    if let Some(readme_path) = &cli.readme {
+    if cli.alternative {
+        run_alternative(&cli.output, &cli.readme, &detail_dir, &entries)?;
+    } else {
+        run_default(&cli.output, &cli.readme, &detail_dir, &entries)?;
+    }
+
+    eprintln!("done");
+    Ok(())
+}
+
+fn run_default(
+    output: &Path,
+    readme: &Option<PathBuf>,
+    detail_dir: &Path,
+    entries: &[PlannedEntry],
+) -> Result<()> {
+    let mut repo = BareRepoWriter::create(output)?;
+
+    if let Some(readme_path) = readme {
         let readme = fs::read(readme_path)
             .with_context(|| format!("failed to read {}", readme_path.display()))?;
-        // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
         repo.commit_static("README.md", &readme, "initial commit", 1_774_839_600, 540)?;
         eprintln!("  committed README.md");
     }
@@ -106,7 +128,53 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     repo.finish()?;
-    eprintln!("done");
+    Ok(())
+}
+
+fn run_alternative(
+    output: &Path,
+    readme: &Option<PathBuf>,
+    detail_dir: &Path,
+    entries: &[PlannedEntry],
+) -> Result<()> {
+    let mut repo = PackRepoWriter::create(output)?;
+
+    if let Some(readme_path) = readme {
+        let readme = fs::read(readme_path)
+            .with_context(|| format!("failed to read {}", readme_path.display()))?;
+        let msg = "initial commit\n\nCo-authored-by: Jihyeon Kim <simnalamburt@gmail.com>";
+        repo.commit_static_authored(
+            "README.md", &readme, msg, 1_774_839_600, 540,
+            "Junghwan Park <reserve.dev@gmail.com>",
+            "Jihyeon Kim <simnalamburt@gmail.com>",
+        )?;
+        eprintln!("  committed README.md");
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
+        let xml = fs::read(&xml_path)
+            .with_context(|| format!("failed to read {}", xml_path.display()))?;
+        let mut detail = parse_law_detail(&xml, &entry.mst)
+            .with_context(|| format!("failed to parse {}", xml_path.display()))?;
+        detail.metadata.amendment = entry.metadata.amendment.clone();
+
+        let markdown = law_to_markdown(&detail)?;
+        let commit_message = build_commit_message(&detail.metadata, &entry.mst);
+        repo.commit_law(
+            &entry.path,
+            &markdown,
+            &commit_message,
+            &detail.metadata.promulgation_date,
+        )
+        .with_context(|| format!("failed to commit MST {}", entry.mst))?;
+
+        if (index + 1) % 500 == 0 || index + 1 == entries.len() {
+            eprintln!("  committed {}/{}", index + 1, entries.len());
+        }
+    }
+
+    repo.finish()?;
     Ok(())
 }
 
@@ -344,6 +412,7 @@ mod tests {
             cache_dir,
             output: output.clone(),
             readme: None,
+            alternative: false,
         })
         .unwrap();
 
