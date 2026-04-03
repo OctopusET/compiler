@@ -16,6 +16,10 @@ openssl = { version = "0.10", features = ["vendored"] }
 tempfile = "3.18"
 time = "0.3"
 
+# OpenSSL is currently bundled to avoid system openssl dependency
+[package.metadata.cargo-shear]
+ignored = ["openssl"]
+
 [profile.profiling]
 inherits = "release"
 debug = 1
