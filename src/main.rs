@@ -73,14 +73,22 @@ fn run(cli: Cli) -> Result<()> {
     let mut repo = BareRepoWriter::create(&cli.output)?;
 
     // 2026-03-30 12:00:00 KST (UTC+9) = 2026-03-30 03:00:00 UTC
+    const INITIAL_COMMIT_EPOCH: i64 = 1_774_839_600;
+    const INITIAL_COMMIT_OFFSET_MINUTES: i32 = 540;
     repo.commit_static(
         "README.md",
         REPOSITORY_README,
         "initial commit",
-        1_774_839_600,
-        540,
+        INITIAL_COMMIT_EPOCH,
+        INITIAL_COMMIT_OFFSET_MINUTES,
     )?;
     eprintln!("  committed README.md");
+    repo.commit_empty_initial_contributor(
+        "Add @simnalamburt as a contributor",
+        INITIAL_COMMIT_EPOCH,
+        INITIAL_COMMIT_OFFSET_MINUTES,
+    )?;
+    eprintln!("  committed contributor marker");
 
     for (index, entry) in entries.iter().enumerate() {
         let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
@@ -351,6 +359,30 @@ mod tests {
         assert_eq!(head.shorthand(), Some("main"));
         let mut revwalk = repo.revwalk().unwrap();
         revwalk.push_head().unwrap();
-        assert_eq!(revwalk.count(), 3);
+        assert_eq!(revwalk.count(), 4);
+
+        let head_commit = head.peel_to_commit().unwrap();
+        let contributor_commit = head_commit.parent(0).unwrap().parent(0).unwrap();
+        assert_eq!(contributor_commit.author().name(), Some("Jihyeon Kim"));
+        assert_eq!(
+            contributor_commit.author().email(),
+            Some("simnalamburt@gmail.com")
+        );
+        assert_eq!(contributor_commit.committer().name(), Some("Jihyeon Kim"));
+        assert_eq!(
+            contributor_commit.committer().email(),
+            Some("simnalamburt@gmail.com")
+        );
+
+        let readme_commit = contributor_commit.parent(0).unwrap();
+        assert_eq!(contributor_commit.tree_id(), readme_commit.tree_id());
+        assert_eq!(
+            contributor_commit.time().seconds(),
+            readme_commit.time().seconds()
+        );
+        assert_eq!(
+            contributor_commit.time().offset_minutes(),
+            readme_commit.time().offset_minutes()
+        );
     }
 }
