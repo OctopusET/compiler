@@ -36,6 +36,9 @@ struct Group {
     cached_sha: Option<[u8; 20]>,
 }
 
+/// Maximum blob cache entries. 0 = unlimited.
+const BLOB_CACHE_MAX: usize = 0;
+
 pub struct PackRepoWriter {
     pw: PackWriter,
     root_files: Vec<Entry>,
@@ -46,8 +49,10 @@ pub struct PackRepoWriter {
     dir_tree_cache: Vec<u8>,
     dir_tree_sha_offsets: Vec<usize>,
     dir_tree_prev_sha: Option<[u8; 20]>,
-    /* blob cache: path → (sha, content) for blob delta chains */
+    /* blob cache: path → (sha, content) for blob delta chains.
+     * capped at BLOB_CACHE_MAX entries; evicts oldest on overflow. */
     prev_blobs: HashMap<String, ([u8; 20], Vec<u8>)>,
+    blob_cache_order: Vec<String>,
 }
 
 impl PackRepoWriter {
@@ -73,6 +78,7 @@ impl PackRepoWriter {
             dir_tree_sha_offsets: Vec::new(),
             dir_tree_prev_sha: None,
             prev_blobs: HashMap::new(),
+            blob_cache_order: Vec::new(),
         })
     }
 
@@ -119,6 +125,19 @@ impl PackRepoWriter {
         } else {
             self.pw.write_obj(3, content)?;
         }
+        /* Update blob cache with LRU eviction (0 = unlimited) */
+        if BLOB_CACHE_MAX > 0 && self.prev_blobs.len() >= BLOB_CACHE_MAX {
+            if let Some(old_key) = self.blob_cache_order.first().cloned() {
+                self.prev_blobs.remove(&old_key);
+                self.blob_cache_order.remove(0);
+            }
+        }
+        if BLOB_CACHE_MAX > 0 {
+            if let Some(pos) = self.blob_cache_order.iter().position(|k| k == path) {
+                self.blob_cache_order.remove(pos);
+            }
+            self.blob_cache_order.push(path.to_owned());
+        }
         self.prev_blobs.insert(path.to_owned(), (blob_sha, content.to_vec()));
 
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -161,6 +180,35 @@ impl PackRepoWriter {
         if !r.status.success() {
             anyhow::bail!("index-pack: {}", String::from_utf8_lossy(&r.stderr));
         }
+        Ok(())
+    }
+
+    /// Save state for incremental updates.
+    /// Saves parent SHA and path→blob_sha mapping (not content).
+    /// Next run loads this to set parent; delta needs fresh content.
+    pub fn save_state(&self, path: &Path) -> Result<()> {
+        let mut state = serde_json::Map::new();
+        if let Some(sha) = self.parent {
+            state.insert("parent".into(), serde_json::Value::String(hex(&sha)));
+        }
+        let blobs: serde_json::Map<String, serde_json::Value> = self.prev_blobs.iter()
+            .map(|(k, (sha, _))| (k.clone(), serde_json::Value::String(hex(sha))))
+            .collect();
+        state.insert("blobs".into(), serde_json::Value::Object(blobs));
+        let groups: Vec<serde_json::Value> = self.groups.iter()
+            .map(|g| {
+                let name = String::from_utf8_lossy(&g.name).to_string();
+                let files: Vec<serde_json::Value> = g.files.iter()
+                    .map(|f| serde_json::json!({
+                        "name": String::from_utf8_lossy(&f.name).to_string(),
+                        "sha": hex(&f.sha),
+                    }))
+                    .collect();
+                serde_json::json!({"name": name, "sha": g.cached_sha.map(|s| hex(&s)), "files": files})
+            })
+            .collect();
+        state.insert("groups".into(), serde_json::Value::Array(groups));
+        fs::write(path, serde_json::to_string(&state)?)?;
         Ok(())
     }
 
