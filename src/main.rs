@@ -257,29 +257,33 @@ fn plan_entries(
     detail_dir: &Path,
     amendments: &HashMap<String, String>,
 ) -> Result<Vec<PlannedEntry>> {
-    let mut files = read_sorted_files(detail_dir, "xml")?;
+    use rayon::prelude::*;
+
+    let files = read_sorted_files(detail_dir, "xml")?;
+
+    /* Parse metadata in parallel */
+    let parsed: Vec<Option<(String, LawMetadata)>> = files
+        .par_iter()
+        .map(|path| {
+            let mst = path.file_stem()?.to_str()?.to_owned();
+            let xml = fs::read(path).ok()?;
+            let metadata = parse_metadata_only(&xml, &mst).ok()?;
+            Some((mst, metadata))
+        })
+        .collect();
+
     let mut entries = Vec::with_capacity(files.len());
     let mut skipped_blank_name = 0usize;
 
-    for path in files.drain(..) {
-        let mst = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
-            .with_context(|| format!("invalid file name: {}", path.display()))?;
-        let xml = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let mut metadata = parse_metadata_only(&xml, &mst)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-
+    for item in parsed.into_iter().flatten() {
+        let (mst, mut metadata) = item;
         if let Some(amendment) = amendments.get(&mst) {
             metadata.amendment = amendment.clone();
         }
-
         if metadata.law_name.trim().is_empty() {
             skipped_blank_name += 1;
             continue;
         }
-
         entries.push(PlannedEntry {
             mst,
             path: String::new(),
