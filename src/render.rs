@@ -100,10 +100,14 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String>
     } else {
         metadata.field.as_str()
     };
-    let title = format!(
-        "{}: {} ({})",
-        metadata.law_type, normalized, metadata.amendment
-    );
+    let title = if metadata.amendment.is_empty() {
+        format!("{}: {}", metadata.law_type, normalized)
+    } else {
+        format!(
+            "{}: {} ({})",
+            metadata.law_type, normalized, metadata.amendment
+        )
+    };
 
     //
     // Assemble the law.go.kr links that appear at the top of every commit message.
@@ -514,5 +518,21 @@ mod tests {
         let message = build_commit_message(&metadata, "1").unwrap();
         assert!(message.contains("소관부처: 미상"));
         assert!(message.contains("법령분야: 미분류"));
+    }
+
+    #[test]
+    fn commit_message_omits_empty_amendment_suffix() {
+        let metadata = LawMetadata {
+            law_name: String::from("테스트법"),
+            law_type: String::from("법률"),
+            promulgation_date: String::from("20240101"),
+            promulgation_number: String::from("00001"),
+            amendment: String::new(),
+            ..LawMetadata::default()
+        };
+
+        let message = build_commit_message(&metadata, "1").unwrap();
+        assert!(message.starts_with("법률: 테스트법\n"));
+        assert!(!message.starts_with("법률: 테스트법 ()\n"));
     }
 }
