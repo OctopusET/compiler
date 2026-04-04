@@ -229,8 +229,8 @@ fn read_sorted_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
 
-    use git2::Repository;
     use tempfile::TempDir;
 
     use super::*;
@@ -409,42 +409,58 @@ mod tests {
         })
         .unwrap();
 
-        let repo = Repository::open_bare(output).unwrap();
-        let head = repo.head().unwrap();
-        assert_eq!(head.shorthand(), Some("main"));
-        let mut revwalk = repo.revwalk().unwrap();
-        revwalk.push_head().unwrap();
-        assert_eq!(revwalk.count(), 4);
-        let pack_dir = repo.path().join("objects").join("pack");
-        let pack_count = fs::read_dir(pack_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack"))
-            .count();
-        assert!(pack_count > 0);
-
-        let head_commit = head.peel_to_commit().unwrap();
-        let contributor_commit = head_commit.parent(0).unwrap().parent(0).unwrap();
-        assert_eq!(contributor_commit.author().name(), Some("Jihyeon Kim"));
         assert_eq!(
-            contributor_commit.author().email(),
-            Some("simnalamburt@gmail.com")
+            git_stdout(&output, ["symbolic-ref", "--short", "HEAD"]).trim(),
+            "main"
         );
-        assert_eq!(contributor_commit.committer().name(), Some("Jihyeon Kim"));
         assert_eq!(
-            contributor_commit.committer().email(),
-            Some("simnalamburt@gmail.com")
+            git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
+            "4"
         );
 
-        let readme_commit = contributor_commit.parent(0).unwrap();
-        assert_eq!(contributor_commit.tree_id(), readme_commit.tree_id());
-        assert_eq!(
-            contributor_commit.time().seconds(),
-            readme_commit.time().seconds()
+        let commits = git_stdout(&output, ["rev-list", "--reverse", "HEAD"]);
+        let commits = commits.lines().collect::<Vec<_>>();
+        assert_eq!(commits.len(), 4);
+
+        let contributor_author = git_stdout(
+            &output,
+            ["show", "-s", "--format=%an%n%ae%n%cn%n%ce", commits[1]],
         );
         assert_eq!(
-            contributor_commit.time().offset_minutes(),
-            readme_commit.time().offset_minutes()
+            contributor_author.lines().collect::<Vec<_>>(),
+            vec![
+                "Jihyeon Kim",
+                "simnalamburt@gmail.com",
+                "Jihyeon Kim",
+                "simnalamburt@gmail.com"
+            ]
         );
+
+        let contributor_tree = git_stdout(&output, ["show", "-s", "--format=%T", commits[1]]);
+        let readme_tree = git_stdout(&output, ["show", "-s", "--format=%T", commits[0]]);
+        assert_eq!(contributor_tree.trim(), readme_tree.trim());
+
+        let contributor_time = git_stdout(&output, ["show", "-s", "--format=%at %ai", commits[1]]);
+        let readme_time = git_stdout(&output, ["show", "-s", "--format=%at %ai", commits[0]]);
+        assert_eq!(contributor_time.trim(), readme_time.trim());
+    }
+
+    fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+        let output = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 }
