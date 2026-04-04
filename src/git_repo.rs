@@ -10,39 +10,12 @@ use flate2::write::ZlibEncoder;
 use openssl::sha;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
-/// Branch name created in every output repository.
-const MAIN_BRANCH: &str = "main";
-/// Fully qualified ref for the output branch tip.
-const MAIN_REF: &str = "refs/heads/main";
-/// Bot author name used for law revision commits.
-const BOT_NAME: &str = "legalize-kr-bot";
-/// Bot author email used for law revision commits.
-const BOT_EMAIL: &str = "bot@legalize.kr";
-/// Author name preserved for the synthetic initial README commit.
-const INITIAL_COMMIT_AUTHOR_NAME: &str = "Junghwan Park";
-/// Author email preserved for the synthetic initial README commit.
-const INITIAL_COMMIT_AUTHOR_EMAIL: &str = "reserve.dev@gmail.com";
-/// Co-author trailers kept on the synthetic initial commit.
-const INITIAL_COMMIT_CO_AUTHORS: &[(&str, &str)] = &[("Jihyeon Kim", "simnalamburt@gmail.com")];
-/// Committer name for the empty contributor marker commit.
-const INITIAL_COMMIT_COMMITTER_NAME: &str = "Jihyeon Kim";
-/// Committer email for the empty contributor marker commit.
-const INITIAL_COMMIT_COMMITTER_EMAIL: &str = "simnalamburt@gmail.com";
 /// Git pack type id for commit objects.
 const PACK_OBJECT_COMMIT: u8 = 1;
 /// Git pack type id for tree objects.
 const PACK_OBJECT_TREE: u8 = 2;
 /// Git pack type id for blob objects.
 const PACK_OBJECT_BLOB: u8 = 3;
-/// Minimum block size indexed when building copy/insert deltas.
-const BLOCK_SIZE: usize = 16;
-/// Step size between indexed source blocks in the delta builder.
-const INDEX_STEP: usize = 16;
-// Small blobs and very different revisions usually lose to the HashMap-heavy delta builder.
-/// Minimum blob size that is worth attempting a delta for.
-const MIN_DELTA_BLOB_BYTES: usize = 128;
-/// Largest allowed size ratio between two revisions before delta building is skipped.
-const MAX_DELTA_BLOB_SIZE_RATIO: usize = 2;
 
 /// Git identity pair used in handcrafted commit objects.
 #[derive(Debug, Clone, Copy)]
@@ -236,6 +209,9 @@ impl BareRepoWriter {
         message: &str,
         promulgation_date: &str,
     ) -> Result<()> {
+        const BOT_NAME: &str = "legalize-kr-bot";
+        const BOT_EMAIL: &str = "bot@legalize.kr";
+
         let time = commit_time(promulgation_date)?;
         self.commit_file(
             path,
@@ -262,10 +238,11 @@ impl BareRepoWriter {
         epoch: i64,
         offset_minutes: i32,
     ) -> Result<()> {
-        let message = append_co_author_trailers(message, INITIAL_COMMIT_CO_AUTHORS);
+        let message =
+            append_co_author_trailers(message, &[("Jihyeon Kim", "simnalamburt@gmail.com")]);
         let author = GitPerson {
-            name: INITIAL_COMMIT_AUTHOR_NAME,
-            email: INITIAL_COMMIT_AUTHOR_EMAIL,
+            name: "Junghwan Park",
+            email: "reserve.dev@gmail.com",
         };
         self.commit_file(
             path,
@@ -291,8 +268,8 @@ impl BareRepoWriter {
             bail!("empty contributor commit requires an existing tree");
         }
         let author = GitPerson {
-            name: INITIAL_COMMIT_COMMITTER_NAME,
-            email: INITIAL_COMMIT_COMMITTER_EMAIL,
+            name: "Jihyeon Kim",
+            email: "simnalamburt@gmail.com",
         };
         let root_sha = self.root_tree_sha()?;
         let commit_sha = self.write_commit(
@@ -328,7 +305,7 @@ impl BareRepoWriter {
                 .arg("-C")
                 .arg(&self.temp_output)
                 .arg("update-ref")
-                .arg(MAIN_REF)
+                .arg("refs/heads/main")
                 .arg(hex(&parent_commit))
                 .output()
                 .context("failed to run git update-ref")?;
@@ -376,10 +353,7 @@ impl BareRepoWriter {
             // Skip expensive delta construction for cases that almost never compress well:
             // identical blobs, very small bodies, or revisions whose sizes diverged too much.
             //
-            if previous.sha != blob_sha
-                && smaller >= MIN_DELTA_BLOB_BYTES
-                && larger <= smaller.saturating_mul(MAX_DELTA_BLOB_SIZE_RATIO)
-            {
+            if previous.sha != blob_sha && smaller >= 128 && larger <= smaller.saturating_mul(2) {
                 let delta = create_delta(&previous.content, content);
                 if delta.len() < content.len() * 3 / 4 {
                     self.writer
@@ -803,6 +777,8 @@ fn make_temp_output_path(output: &Path) -> Result<PathBuf> {
 
 /// Initializes the temporary bare repository, preferring reftable refs when available.
 fn init_bare_repo(repo_dir: &Path) -> Result<()> {
+    const MAIN_BRANCH: &str = "main";
+
     let mut init_reftable = git_command();
     init_reftable
         .arg("init")
@@ -977,6 +953,9 @@ fn compress(data: &[u8]) -> Vec<u8> {
 
 /// Builds a Git copy/insert delta from `src` to `dst`.
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
+    /// Minimum block size indexed when building copy/insert deltas.
+    const BLOCK_SIZE: usize = 16;
+
     //
     // Index fixed-size source blocks so destination scanning can prefer copy commands.
     //
@@ -990,7 +969,7 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
     }
 
     let mut index = HashMap::<u32, Vec<usize>>::new();
-    for source_offset in (0..src.len().saturating_sub(BLOCK_SIZE - 1)).step_by(INDEX_STEP) {
+    for source_offset in (0..src.len().saturating_sub(BLOCK_SIZE - 1)).step_by(16) {
         let hash = block_hash(&src[source_offset..source_offset + BLOCK_SIZE]);
         index.entry(hash).or_default().push(source_offset);
     }
