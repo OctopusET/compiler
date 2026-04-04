@@ -696,7 +696,7 @@ fn tree_sort_cmp(
 }
 
 fn compress(data: &[u8]) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder
         .write_all(data)
         .expect("zlib write to Vec cannot fail");
