@@ -97,35 +97,44 @@ fn run(cli: Cli) -> Result<()> {
     eprintln!("pass 1/2: scanning cache metadata...");
     // Pass 1 only reads XML metadata so the final full parse can follow a stable order.
     let entries = {
-        let mut files = read_sorted_files(&detail_dir, "xml")?;
+        let files = read_sorted_files(&detail_dir, "xml")?;
+        let parsed = files
+            .par_iter()
+            .map(|path| -> Result<Option<PlannedEntry>> {
+                let mst = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(ToOwned::to_owned)
+                    .with_context(|| format!("invalid file name: {}", path.display()))?;
+                let xml =
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+                let mut metadata = parse_metadata_only(&xml, &mst)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+
+                if let Some(amendment) = history.get(&mst) {
+                    metadata.amendment = amendment.clone();
+                }
+
+                if metadata.law_name.trim().is_empty() {
+                    return Ok(None);
+                }
+
+                Ok(Some(PlannedEntry {
+                    mst,
+                    path: String::new(),
+                    metadata,
+                }))
+            })
+            .collect::<Vec<_>>();
+
         let mut entries = Vec::with_capacity(files.len());
         let mut skipped_blank_name = 0usize;
 
-        for path in files.drain(..) {
-            let mst = path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .map(ToOwned::to_owned)
-                .with_context(|| format!("invalid file name: {}", path.display()))?;
-            let xml =
-                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-            let mut metadata = parse_metadata_only(&xml, &mst)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-
-            if let Some(amendment) = history.get(&mst) {
-                metadata.amendment = amendment.clone();
+        for planned in parsed {
+            match planned? {
+                Some(entry) => entries.push(entry),
+                None => skipped_blank_name += 1,
             }
-
-            if metadata.law_name.trim().is_empty() {
-                skipped_blank_name += 1;
-                continue;
-            }
-
-            entries.push(PlannedEntry {
-                mst,
-                path: String::new(),
-                metadata,
-            });
         }
 
         entries.sort_by(|left, right| {
