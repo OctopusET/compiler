@@ -8,7 +8,7 @@ use std::process::{self, Command, Output};
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use openssl::sha;
+use sha1::{Digest, Sha1};
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
 /// Supported pack entry kinds emitted by the handcrafted writer.
@@ -790,7 +790,7 @@ impl PackWriter {
         self.body_file.flush()?;
 
         let mut output = BufWriter::with_capacity(1 << 20, File::create(&self.path)?);
-        let mut hasher = sha::Sha1::new();
+        let mut hasher = Sha1::new();
 
         let pack_header = [
             b'P',
@@ -807,7 +807,7 @@ impl PackWriter {
             self.object_count as u8,
         ];
         output.write_all(&pack_header)?;
-        hasher.update(&pack_header);
+        hasher.update(pack_header);
 
         let mut body = BufReader::with_capacity(1 << 20, File::open(&self.body_path)?);
         let mut buffer = [0_u8; 1 << 20];
@@ -821,7 +821,8 @@ impl PackWriter {
             hasher.update(chunk);
         }
 
-        output.write_all(&hasher.finish())?;
+        let checksum: [u8; 20] = hasher.finalize().into();
+        output.write_all(&checksum)?;
         output.flush()?;
         fs::remove_file(&self.body_path)
             .with_context(|| format!("failed to remove {}", self.body_path.display()))?;
@@ -1120,7 +1121,7 @@ fn encode_varint(out: &mut Vec<u8>, mut value: usize) {
 
 /// Computes the canonical Git object id for one unhashed object body.
 fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
-    let mut hasher = sha::Sha1::new();
+    let mut hasher = Sha1::new();
     // Avoid allocating a header string in this hot hash path.
     let mut len_buf = [0_u8; 20];
     let mut cursor = len_buf.len();
@@ -1137,9 +1138,9 @@ fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
     hasher.update(type_name);
     hasher.update(b" ");
     hasher.update(&len_buf[cursor..]);
-    hasher.update(&[0]);
+    hasher.update([0]);
     hasher.update(data);
-    hasher.finish()
+    hasher.finalize().into()
 }
 
 /// Hex-encodes one object id for commit bodies and Git subprocess arguments.
