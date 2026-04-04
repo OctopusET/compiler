@@ -13,7 +13,6 @@ mod render;
 /// Parses cached XML documents into metadata and article structures.
 mod xml_parser;
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -116,9 +115,7 @@ fn run(cli: Cli) -> Result<()> {
                 let entries: Vec<HistoryEntry> = serde_json::from_slice(&bytes)
                     .with_context(|| format!("failed to parse {}", path.display()))?;
                 for entry in entries {
-                    if !entry.mst.is_empty() {
-                        amendments.insert(entry.mst, entry.amendment);
-                    }
+                    amendments.insert(entry.mst, entry.amendment);
                 }
             }
             amendments
@@ -133,7 +130,7 @@ fn run(cli: Cli) -> Result<()> {
         let files = read_sorted_files(&detail_dir, "xml")?;
         let parsed = files
             .par_iter()
-            .map(|path| -> Result<Option<PlannedEntry>> {
+            .map(|path| -> Result<PlannedEntry> {
                 let mst = path
                     .file_stem()
                     .and_then(|name| name.to_str())
@@ -148,67 +145,53 @@ fn run(cli: Cli) -> Result<()> {
                     metadata.amendment = amendment.clone();
                 }
 
-                if metadata.law_name.trim().is_empty() {
-                    return Ok(None);
-                }
-
-                Ok(Some(PlannedEntry {
+                Ok(PlannedEntry {
                     mst,
                     path: RepoPathBuf::root_file(String::new()),
                     metadata,
-                }))
+                })
             })
             .collect::<Vec<_>>();
 
         let mut entries = Vec::with_capacity(files.len());
-        let mut skipped_blank_name = 0usize;
-
         for planned in parsed {
-            match planned? {
-                Some(entry) => entries.push(entry),
-                None => skipped_blank_name += 1,
-            }
+            entries.push(planned?);
         }
 
         entries.sort_by(|left, right| {
-            let parse_numeric_key = |value: &str| value.parse::<u64>().ok();
             left.metadata
                 .promulgation_date
                 .cmp(&right.metadata.promulgation_date)
                 .then_with(|| left.metadata.law_name.cmp(&right.metadata.law_name))
                 .then_with(|| {
-                    // Promulgation numbers are meaningful ordering keys when present.
-                    match (
-                        parse_numeric_key(&left.metadata.promulgation_number),
-                        parse_numeric_key(&right.metadata.promulgation_number),
-                    ) {
-                        (Some(left), Some(right)) => left.cmp(&right),
-                        (Some(_), None) => Ordering::Less,
-                        (None, Some(_)) => Ordering::Greater,
-                        (None, None) => left
-                            .metadata
-                            .promulgation_number
-                            .cmp(&right.metadata.promulgation_number),
-                    }
+                    left.metadata
+                        .promulgation_number
+                        .parse::<u64>()
+                        .expect("cache 공포번호 must be numeric")
+                        .cmp(
+                            &right
+                                .metadata
+                                .promulgation_number
+                                .parse::<u64>()
+                                .expect("cache 공포번호 must be numeric"),
+                        )
                 })
-                .then_with(
-                    || match (parse_numeric_key(&left.mst), parse_numeric_key(&right.mst)) {
-                        (Some(left), Some(right)) => left.cmp(&right),
-                        _ => left.mst.cmp(&right.mst),
-                    },
-                )
+                .then_with(|| {
+                    left.mst
+                        .parse::<u64>()
+                        .expect("detail xml filenames must be numeric MSTs")
+                        .cmp(
+                            &right
+                                .mst
+                                .parse::<u64>()
+                                .expect("detail xml filenames must be numeric MSTs"),
+                        )
+                })
         });
 
         let mut registry = PathRegistry::default();
         for entry in &mut entries {
             entry.path = registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type);
-        }
-
-        if skipped_blank_name > 0 {
-            eprintln!(
-                "  skipped {} entries with empty law names",
-                skipped_blank_name
-            );
         }
 
         entries
@@ -444,10 +427,6 @@ mod tests {
                     metadata.amendment = amendment.clone();
                 }
 
-                if metadata.law_name.trim().is_empty() {
-                    continue;
-                }
-
                 entries.push(PlannedEntry {
                     mst,
                     path: RepoPathBuf::root_file(String::new()),
@@ -456,30 +435,33 @@ mod tests {
             }
 
             entries.sort_by(|left, right| {
-                let parse_numeric_key = |value: &str| value.parse::<u64>().ok();
                 left.metadata
                     .promulgation_date
                     .cmp(&right.metadata.promulgation_date)
                     .then_with(|| left.metadata.law_name.cmp(&right.metadata.law_name))
                     .then_with(|| {
-                        match (
-                            parse_numeric_key(&left.metadata.promulgation_number),
-                            parse_numeric_key(&right.metadata.promulgation_number),
-                        ) {
-                            (Some(left), Some(right)) => left.cmp(&right),
-                            (Some(_), None) => Ordering::Less,
-                            (None, Some(_)) => Ordering::Greater,
-                            (None, None) => left
-                                .metadata
-                                .promulgation_number
-                                .cmp(&right.metadata.promulgation_number),
-                        }
+                        left.metadata
+                            .promulgation_number
+                            .parse::<u64>()
+                            .expect("cache 공포번호 must be numeric")
+                            .cmp(
+                                &right
+                                    .metadata
+                                    .promulgation_number
+                                    .parse::<u64>()
+                                    .expect("cache 공포번호 must be numeric"),
+                            )
                     })
                     .then_with(|| {
-                        match (parse_numeric_key(&left.mst), parse_numeric_key(&right.mst)) {
-                            (Some(left), Some(right)) => left.cmp(&right),
-                            _ => left.mst.cmp(&right.mst),
-                        }
+                        left.mst
+                            .parse::<u64>()
+                            .expect("detail xml filenames must be numeric MSTs")
+                            .cmp(
+                                &right
+                                    .mst
+                                    .parse::<u64>()
+                                    .expect("detail xml filenames must be numeric MSTs"),
+                            )
                     })
             });
 

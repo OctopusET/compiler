@@ -71,17 +71,8 @@ pub fn normalize_law_name(name: &str) -> String {
         .collect()
 }
 
-/// Formats `YYYYMMDD` values as `YYYY-MM-DD` when possible.
-pub fn format_date(date: &str) -> String {
-    if date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()) {
-        format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8])
-    } else {
-        date.to_owned()
-    }
-}
-
 /// Formats a required `YYYYMMDD` date as `YYYY-MM-DD`.
-fn format_required_yyyymmdd(date: &str) -> Result<String> {
+pub fn format_date(date: &str) -> Result<String> {
     if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
         bail!("expected YYYYMMDD date: {date}");
     }
@@ -92,28 +83,17 @@ fn format_required_yyyymmdd(date: &str) -> Result<String> {
 /// Builds the Git commit message for one law revision.
 pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String> {
     //
-    // Normalize display text and fill the same fallback labels the legacy pipeline used.
+    // Normalize display text and project the cache metadata directly into the legacy message shape.
     //
     let normalized = normalize_law_name(&metadata.law_name);
     let compact = normalized.replace(' ', "");
-    let departments = if metadata.department_name.is_empty() {
-        "미상".to_owned()
-    } else {
-        metadata.department_name.clone()
-    };
-    let prom_date = format_required_yyyymmdd(&metadata.promulgation_date)?;
+    let prom_date = format_date(&metadata.promulgation_date)?;
     let prom_num = metadata.promulgation_number.clone();
     let prom_raw = metadata.promulgation_date.clone();
-    let field = if metadata.field.is_empty() {
-        "미분류".to_owned()
-    } else {
-        metadata.field.clone()
-    };
-
-    let mut title = format!("{}: {}", metadata.law_type, normalized);
-    if !metadata.amendment.is_empty() {
-        title.push_str(&format!(" ({})", metadata.amendment));
-    }
+    let title = format!(
+        "{}: {} ({})",
+        metadata.law_type, normalized, metadata.amendment
+    );
 
     //
     // Assemble the law.go.kr links that appear at the top of every commit message.
@@ -126,17 +106,15 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String>
     //
     let mut lines = vec![title, String::new()];
     lines.push(format!("법령 전문: {url_law}"));
-    if !prom_num.is_empty() {
-        lines.push(format!(
-            "제개정문: https://www.law.go.kr/법령/제개정문/{compact}/({prom_num},{prom_raw})"
-        ));
-    }
+    lines.push(format!(
+        "제개정문: https://www.law.go.kr/법령/제개정문/{compact}/({prom_num},{prom_raw})"
+    ));
     lines.push(format!("신구법비교: {url_diff}"));
     lines.push(String::new());
     lines.push(format!("공포일자: {prom_date}"));
     lines.push(format!("공포번호: {prom_num}"));
-    lines.push(format!("소관부처: {departments}"));
-    lines.push(format!("법령분야: {field}"));
+    lines.push(format!("소관부처: {}", metadata.department_name));
+    lines.push(format!("법령분야: {}", metadata.field));
     lines.push(format!("법령MST: {mst}"));
     Ok(lines.join("\n"))
 }
@@ -152,10 +130,7 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
 
         Frontmatter {
             title: normalized.clone(),
-            mst: match detail.metadata.mst.parse::<u64>() {
-                Ok(number) => ScalarValue::Number(number),
-                Err(_) => ScalarValue::String(detail.metadata.mst.clone()),
-            },
+            mst: detail.metadata.mst.parse::<u64>()?,
             law_id: detail.metadata.law_id.clone(),
             law_type: detail.metadata.law_type.clone(),
             law_type_code: detail.metadata.law_type_code.clone(),
@@ -164,12 +139,11 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
                 .department_name
                 .split(',')
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
                 .collect(),
-            promulgation_date: format_required_yyyymmdd(&detail.metadata.promulgation_date)?,
+            promulgation_date: format_date(&detail.metadata.promulgation_date)?,
             promulgation_number: detail.metadata.promulgation_number.clone(),
-            enforcement_date: format_date(&detail.metadata.enforcement_date),
+            enforcement_date: format_date(&detail.metadata.enforcement_date)?,
             field: detail.metadata.field.clone(),
             status: String::from("시행"),
             source: format!("https://www.law.go.kr/법령/{}", normalized.replace(' ', "")),
@@ -373,9 +347,9 @@ struct Frontmatter {
     /// Display title used as the Markdown heading and `제목`.
     #[serde(rename = "제목")]
     title: String,
-    /// MST identifier kept numeric when possible for legacy parity.
+    /// MST identifier rendered as the numeric value present in every cache filename.
     #[serde(rename = "법령MST")]
-    mst: ScalarValue,
+    mst: u64,
     /// Stable law.go.kr law identifier.
     #[serde(rename = "법령ID")]
     law_id: String,
@@ -411,16 +385,6 @@ struct Frontmatter {
     original_title: Option<String>,
 }
 
-/// Scalar YAML value that keeps MST numeric when possible.
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum ScalarValue {
-    /// Numeric MST representation.
-    Number(u64),
-    /// String fallback when MST is not parseable as an integer.
-    String(String),
-}
-
 #[cfg(test)]
 mod tests {
     use crate::xml_parser::Article;
@@ -445,6 +409,7 @@ mod tests {
     fn markdown_renders_python_style_lists_and_addenda() {
         let detail = LawDetail {
             metadata: LawMetadata {
+                mst: String::from("1"),
                 law_name: String::from("테스트법"),
                 law_id: String::from("000001"),
                 law_type: String::from("법률"),
@@ -487,8 +452,10 @@ mod tests {
     fn markdown_rejects_non_compact_promulgation_dates() {
         let detail = LawDetail {
             metadata: LawMetadata {
+                mst: String::from("1"),
                 law_name: String::from("테스트법"),
                 promulgation_date: String::from("2024-01-01"),
+                enforcement_date: String::from("20240101"),
                 ..LawMetadata::default()
             },
             ..LawDetail::default()
