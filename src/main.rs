@@ -58,6 +58,8 @@ struct HistoryEntry {
 struct PlannedEntry {
     /// Law MST used for file lookup and stable ordering.
     mst: String,
+    /// Original detail XML path used for targeted warning/error messages.
+    source_path: PathBuf,
     /// Final repository path assigned after collision handling.
     path: RepoPathBuf,
     /// Metadata collected during the cheap planning pass.
@@ -130,7 +132,7 @@ fn run(cli: Cli) -> Result<()> {
         let files = read_sorted_files(&detail_dir, "xml")?;
         let parsed = files
             .par_iter()
-            .map(|path| -> Result<PlannedEntry> {
+            .map(|path| -> Result<Option<PlannedEntry>> {
                 let mst = path
                     .file_stem()
                     .and_then(|name| name.to_str())
@@ -138,24 +140,52 @@ fn run(cli: Cli) -> Result<()> {
                     .with_context(|| format!("invalid file name: {}", path.display()))?;
                 let xml =
                     fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-                let mut metadata = parse_metadata_only(&xml, &mst)
-                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                let mut metadata = match parse_metadata_only(&xml, &mst) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        eprintln!(
+                            "warning: skipping unparsable cache file {}: {error:#}",
+                            path.display()
+                        );
+                        return Ok(None);
+                    }
+                };
+
+                //
+                // Some cached detail files are HTML error pages instead of law XML. Those never
+                // populate the basic metadata block, so exclude them while keeping every real XML
+                // field assumption strict.
+                //
+                if metadata.law_name.is_empty()
+                    && metadata.law_id.is_empty()
+                    && metadata.law_type.is_empty()
+                    && metadata.promulgation_date.is_empty()
+                {
+                    eprintln!(
+                        "warning: skipping unparsable cache file {}: missing basic law metadata",
+                        path.display()
+                    );
+                    return Ok(None);
+                }
 
                 if let Some(amendment) = history.get(&mst) {
                     metadata.amendment = amendment.clone();
                 }
 
-                Ok(PlannedEntry {
+                Ok(Some(PlannedEntry {
                     mst,
+                    source_path: path.clone(),
                     path: RepoPathBuf::root_file(String::new()),
                     metadata,
-                })
+                }))
             })
             .collect::<Vec<_>>();
 
         let mut entries = Vec::with_capacity(files.len());
         for planned in parsed {
-            entries.push(planned?);
+            if let Some(planned) = planned? {
+                entries.push(planned);
+            }
         }
 
         entries.sort_by(|left, right| {
@@ -167,13 +197,23 @@ fn run(cli: Cli) -> Result<()> {
                     left.metadata
                         .promulgation_number
                         .parse::<u64>()
-                        .expect("cache 공포번호 must be numeric")
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "cache 공포번호 must be numeric: {}: {error:?}",
+                                left.source_path.display()
+                            )
+                        })
                         .cmp(
                             &right
                                 .metadata
                                 .promulgation_number
                                 .parse::<u64>()
-                                .expect("cache 공포번호 must be numeric"),
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "cache 공포번호 must be numeric: {}: {error:?}",
+                                        right.source_path.display()
+                                    )
+                                }),
                         )
                 })
                 .then_with(|| {
@@ -349,6 +389,13 @@ mod tests {
 </법령>
 "#;
 
+    const SAMPLE_INVALID_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><title>Error</title></head>
+<body>XML 파싱중 오류 발생</body>
+</html>
+"#;
+
     const SAMPLE_XML_2: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <법령>
   <기본정보>
@@ -403,6 +450,7 @@ mod tests {
         write_sample_xml(&detail_dir, "10", SAMPLE_XML_2);
         write_sample_xml(&detail_dir, "1", SAMPLE_XML_1);
         write_sample_xml(&detail_dir, "2", SAMPLE_XML_3);
+        write_sample_xml(&detail_dir, "63422", SAMPLE_INVALID_HTML);
 
         let mut history = HashMap::new();
         history.insert(String::from("1"), String::from("제정"));
@@ -421,7 +469,18 @@ mod tests {
                     .map(ToOwned::to_owned)
                     .unwrap();
                 let xml = fs::read(&path).unwrap();
-                let mut metadata = parse_metadata_only(&xml, &mst).unwrap();
+                let mut metadata = match parse_metadata_only(&xml, &mst) {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+
+                if metadata.law_name.is_empty()
+                    && metadata.law_id.is_empty()
+                    && metadata.law_type.is_empty()
+                    && metadata.promulgation_date.is_empty()
+                {
+                    continue;
+                }
 
                 if let Some(amendment) = history.get(&mst) {
                     metadata.amendment = amendment.clone();
@@ -429,6 +488,7 @@ mod tests {
 
                 entries.push(PlannedEntry {
                     mst,
+                    source_path: path.clone(),
                     path: RepoPathBuf::root_file(String::new()),
                     metadata,
                 });
@@ -443,13 +503,23 @@ mod tests {
                         left.metadata
                             .promulgation_number
                             .parse::<u64>()
-                            .expect("cache 공포번호 must be numeric")
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "cache 공포번호 must be numeric: {}: {error:?}",
+                                    left.source_path.display()
+                                )
+                            })
                             .cmp(
                                 &right
                                     .metadata
                                     .promulgation_number
                                     .parse::<u64>()
-                                    .expect("cache 공포번호 must be numeric"),
+                                    .unwrap_or_else(|error| {
+                                        panic!(
+                                            "cache 공포번호 must be numeric: {}: {error:?}",
+                                            right.source_path.display()
+                                        )
+                                    }),
                             )
                     })
                     .then_with(|| {
