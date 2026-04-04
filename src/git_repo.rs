@@ -63,6 +63,11 @@ pub struct BareRepoWriter {
     root_files: Vec<Entry>,
     groups: Vec<Group>,
     group_indices: HashMap<Vec<u8>, usize>,
+    kr_tree_cache: Vec<u8>,
+    kr_tree_sha_offsets: Vec<usize>,
+    current_kr_tree_sha: Option<[u8; 20]>,
+    kr_tree_structure_dirty: bool,
+    dirty_group_index: Option<usize>,
     parent_commit: Option<[u8; 20]>,
     current_root_sha: Option<[u8; 20]>,
     tree_dirty: bool,
@@ -98,6 +103,11 @@ impl BareRepoWriter {
             root_files: Vec::new(),
             groups: Vec::new(),
             group_indices: HashMap::new(),
+            kr_tree_cache: Vec::new(),
+            kr_tree_sha_offsets: Vec::new(),
+            current_kr_tree_sha: None,
+            kr_tree_structure_dirty: false,
+            dirty_group_index: None,
             parent_commit: None,
             current_root_sha: None,
             tree_dirty: false,
@@ -240,6 +250,7 @@ impl BareRepoWriter {
         {
             [name] => {
                 upsert(&mut self.root_files, name.as_bytes(), blob_sha, false);
+                self.dirty_group_index = None;
             }
             ["kr", group, filename] => {
                 let group_index = self.ensure_group(group.as_bytes());
@@ -250,6 +261,7 @@ impl BareRepoWriter {
                     false,
                 );
                 self.groups[group_index].cached_sha = None;
+                self.dirty_group_index = Some(group_index);
             }
             _ => bail!("unsupported repository path: {path}"),
         }
@@ -283,6 +295,7 @@ impl BareRepoWriter {
             }
         }
         self.group_indices.insert(name.to_vec(), position);
+        self.kr_tree_structure_dirty = true;
         position
     }
 
@@ -303,18 +316,53 @@ impl BareRepoWriter {
         }
 
         let kr_tree = if self.groups.is_empty() {
+            self.kr_tree_cache.clear();
+            self.kr_tree_sha_offsets.clear();
+            self.current_kr_tree_sha = None;
+            self.kr_tree_structure_dirty = false;
+            self.dirty_group_index = None;
             None
         } else {
-            let mut entries = Vec::with_capacity(self.groups.len());
-            for group in &self.groups {
-                entries.push(Entry {
-                    name: group.name.clone(),
-                    sha: group.cached_sha.context("missing cached subtree SHA")?,
-                    is_tree: true,
-                });
+            if self.kr_tree_structure_dirty || self.kr_tree_sha_offsets.len() != self.groups.len() {
+                self.kr_tree_cache.clear();
+                self.kr_tree_sha_offsets.clear();
+                for group in &self.groups {
+                    self.kr_tree_cache.extend_from_slice(b"40000 ");
+                    self.kr_tree_cache.extend_from_slice(&group.name);
+                    self.kr_tree_cache.push(0);
+                    self.kr_tree_sha_offsets.push(self.kr_tree_cache.len());
+                    self.kr_tree_cache.extend_from_slice(
+                        &group.cached_sha.context("missing cached subtree SHA")?,
+                    );
+                }
+                self.kr_tree_structure_dirty = false;
+                let kr_tree_sha = self
+                    .writer
+                    .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
+                self.current_kr_tree_sha = Some(kr_tree_sha);
+                self.dirty_group_index = None;
+                Some(kr_tree_sha)
+            } else if let Some(index) = self.dirty_group_index.take() {
+                let sha_offset = self.kr_tree_sha_offsets[index];
+                self.kr_tree_cache[sha_offset..sha_offset + 20].copy_from_slice(
+                    &self.groups[index]
+                        .cached_sha
+                        .context("missing cached subtree SHA")?,
+                );
+                let kr_tree_sha = self
+                    .writer
+                    .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
+                self.current_kr_tree_sha = Some(kr_tree_sha);
+                Some(kr_tree_sha)
+            } else if let Some(kr_tree_sha) = self.current_kr_tree_sha {
+                Some(kr_tree_sha)
+            } else {
+                let kr_tree_sha = self
+                    .writer
+                    .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
+                self.current_kr_tree_sha = Some(kr_tree_sha);
+                Some(kr_tree_sha)
             }
-            let tree = tree_bytes(&entries);
-            Some(self.writer.write_object(PACK_OBJECT_TREE, &tree)?)
         };
 
         let mut root_entries =
