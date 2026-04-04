@@ -933,13 +933,24 @@ fn encode_varint(out: &mut Vec<u8>, mut value: usize) {
 }
 
 fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
-    let header = format!(
-        "{} {}\0",
-        std::str::from_utf8(type_name).expect("invalid object type name"),
-        data.len()
-    );
     let mut hasher = sha::Sha1::new();
-    hasher.update(header.as_bytes());
+    // Avoid allocating a header string in this hot hash path.
+    let mut len_buf = [0_u8; 20];
+    let mut cursor = len_buf.len();
+    let mut value = data.len();
+    loop {
+        cursor -= 1;
+        len_buf[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+
+    hasher.update(type_name);
+    hasher.update(b" ");
+    hasher.update(&len_buf[cursor..]);
+    hasher.update(&[0]);
     hasher.update(data);
     hasher.finish()
 }
