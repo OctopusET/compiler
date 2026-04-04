@@ -47,9 +47,58 @@ struct GitPerson<'a> {
 
 /// Commit timestamp that is always rendered in Korea Standard Time (`+0900`).
 #[derive(Debug, Clone, Copy)]
-struct GitTimestampKst {
+pub struct GitTimestampKst {
     /// Unix timestamp in seconds.
     epoch: i64,
+}
+
+impl GitTimestampKst {
+    /// Converts a promulgation date into the deterministic noon-KST commit timestamp.
+    pub fn from_promulgation_date(promulgation_date: &str) -> Result<Self> {
+        //
+        // Normalize both `YYYYMMDD` and `YYYY-MM-DD` forms into the canonical date string the
+        // historical pipeline implicitly used when deriving commit timestamps.
+        //
+        let effective_date = if promulgation_date.len() == 8
+            && promulgation_date.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            format!(
+                "{}-{}-{}",
+                &promulgation_date[..4],
+                &promulgation_date[4..6],
+                &promulgation_date[6..8]
+            )
+        } else {
+            promulgation_date.to_owned()
+        };
+
+        //
+        // Clamp malformed inputs and pre-epoch dates before conversion so reruns keep producing the
+        // same commit ids even when upstream metadata is incomplete or predates Unix time.
+        //
+        let effective_date = if effective_date.len() != 10 {
+            String::from("2000-01-01")
+        } else if effective_date.as_str() < "1970-01-01" {
+            String::from("1970-01-01")
+        } else {
+            effective_date
+        };
+
+        //
+        // Every revision commit lands at noon KST. The fixed wall-clock time keeps hashes stable
+        // while still rendering as a readable calendar date in Git history.
+        //
+        let year = effective_date[0..4].parse::<i32>()?;
+        let month = effective_date[5..7].parse::<u8>()?;
+        let day = effective_date[8..10].parse::<u8>()?;
+        let month = Month::try_from(month)?;
+        let date = Date::from_calendar_date(year, month, day)?;
+        let datetime = PrimitiveDateTime::new(date, CivilTime::from_hms(12, 0, 0)?);
+        let offset = UtcOffset::from_hms(9, 0, 0)?;
+        Ok(Self {
+            epoch: datetime.assume_offset(offset).unix_timestamp(),
+        })
+    }
 }
 
 /// One tree entry inside either the root tree or a law group subtree.
@@ -231,13 +280,12 @@ impl BareRepoWriter {
         path: &str,
         markdown: &[u8],
         message: &str,
-        promulgation_date: &str,
+        time: GitTimestampKst,
     ) -> Result<()> {
         let bot = GitPerson {
             name: "legalize-kr-bot",
             email: "bot@legalize.kr",
         };
-        let time = commit_time(promulgation_date)?;
         self.commit_file(path, markdown, message, bot, bot, time)
     }
 
@@ -1100,53 +1148,6 @@ fn hex(sha: &[u8; 20]) -> String {
     encoded
 }
 
-/// Converts a promulgation date into the deterministic noon-KST commit timestamp.
-fn commit_time(promulgation_date: &str) -> Result<GitTimestampKst> {
-    //
-    // Normalize both `YYYYMMDD` and `YYYY-MM-DD` forms into the canonical date string the
-    // historical pipeline implicitly used when deriving commit timestamps.
-    //
-    let effective_date = if promulgation_date.len() == 8
-        && promulgation_date.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        format!(
-            "{}-{}-{}",
-            &promulgation_date[..4],
-            &promulgation_date[4..6],
-            &promulgation_date[6..8]
-        )
-    } else {
-        promulgation_date.to_owned()
-    };
-
-    //
-    // Clamp malformed inputs and pre-epoch dates before conversion so reruns keep producing the
-    // same commit ids even when upstream metadata is incomplete or predates Unix time.
-    //
-    let effective_date = if effective_date.len() != 10 {
-        String::from("2000-01-01")
-    } else if effective_date.as_str() < "1970-01-01" {
-        String::from("1970-01-01")
-    } else {
-        effective_date
-    };
-
-    //
-    // Every revision commit lands at noon KST. The fixed wall-clock time keeps hashes stable while
-    // still rendering as a readable calendar date in Git history.
-    //
-    let year = effective_date[0..4].parse::<i32>()?;
-    let month = effective_date[5..7].parse::<u8>()?;
-    let day = effective_date[8..10].parse::<u8>()?;
-    let month = Month::try_from(month)?;
-    let date = Date::from_calendar_date(year, month, day)?;
-    let datetime = PrimitiveDateTime::new(date, CivilTime::from_hms(12, 0, 0)?);
-    let offset = UtcOffset::from_hms(9, 0, 0)?;
-    Ok(GitTimestampKst {
-        epoch: datetime.assume_offset(offset).unix_timestamp(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1170,7 +1171,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (output, mut writer) = new_writer(&temp);
         writer
-            .commit_law("kr/테스트법/법률.md", b"body", "message", "19491021")
+            .commit_law(
+                "kr/테스트법/법률.md",
+                b"body",
+                "message",
+                GitTimestampKst::from_promulgation_date("19491021").unwrap(),
+            )
             .unwrap();
         writer.finish().unwrap();
 
@@ -1196,7 +1202,12 @@ mod tests {
 
         let result = (|| -> Result<()> {
             let mut writer = BareRepoWriter::create(Path::new("output.git"))?;
-            writer.commit_law("kr/테스트법/법률.md", b"body", "message", "20240101")?;
+            writer.commit_law(
+                "kr/테스트법/법률.md",
+                b"body",
+                "message",
+                GitTimestampKst::from_promulgation_date("20240101")?,
+            )?;
             writer.finish()?;
             Ok(())
         })();

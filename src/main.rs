@@ -23,7 +23,7 @@ use clap::Parser;
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use crate::git_repo::BareRepoWriter;
+use crate::git_repo::{BareRepoWriter, GitTimestampKst};
 use crate::render::{PathRegistry, build_commit_message, law_to_markdown};
 use crate::xml_parser::{LawDetail, LawMetadata, parse_law_body, parse_metadata_only};
 
@@ -73,8 +73,8 @@ struct Rendered {
     markdown: Vec<u8>,
     /// Commit message for this revision.
     message: String,
-    /// Promulgation date reused for timestamp generation.
-    promulgation_date: String,
+    /// Deterministic KST commit timestamp derived during pass 2.
+    time: GitTimestampKst,
 }
 
 /*
@@ -280,7 +280,7 @@ fn run(cli: Cli) -> Result<()> {
                 &rendered.path,
                 &rendered.markdown,
                 &rendered.message,
-                &rendered.promulgation_date,
+                rendered.time,
             )?;
             committed += 1;
             if committed.is_multiple_of(500) || committed == total {
@@ -311,6 +311,7 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
         articles: body.articles,
         addenda: body.addenda,
     };
+    let time = GitTimestampKst::from_promulgation_date(&detail.metadata.promulgation_date)?;
 
     let markdown = law_to_markdown(&detail)?;
     let message = build_commit_message(&detail.metadata, &entry.mst);
@@ -318,7 +319,7 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
         path: entry.path.clone(),
         markdown,
         message,
-        promulgation_date: detail.metadata.promulgation_date.clone(),
+        time,
     })
 }
 
