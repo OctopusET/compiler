@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -62,6 +62,7 @@ pub struct BareRepoWriter {
     final_output: PathBuf,
     root_files: Vec<Entry>,
     groups: Vec<Group>,
+    group_indices: HashMap<Vec<u8>, usize>,
     parent_commit: Option<[u8; 20]>,
     current_root_sha: Option<[u8; 20]>,
     tree_dirty: bool,
@@ -96,6 +97,7 @@ impl BareRepoWriter {
             final_output,
             root_files: Vec::new(),
             groups: Vec::new(),
+            group_indices: HashMap::new(),
             parent_commit: None,
             current_root_sha: None,
             tree_dirty: false,
@@ -260,7 +262,7 @@ impl BareRepoWriter {
     }
 
     fn ensure_group(&mut self, name: &[u8]) -> usize {
-        if let Some(index) = self.groups.iter().position(|group| group.name == name) {
+        if let Some(&index) = self.group_indices.get(name) {
             return index;
         }
 
@@ -275,6 +277,12 @@ impl BareRepoWriter {
                 cached_sha: None,
             },
         );
+        for index in self.group_indices.values_mut() {
+            if *index >= position {
+                *index += 1;
+            }
+        }
+        self.group_indices.insert(name.to_vec(), position);
         position
     }
 
