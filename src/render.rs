@@ -90,6 +90,16 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String>
     let prom_date = format_date(&metadata.promulgation_date)?;
     let prom_num = metadata.promulgation_number.clone();
     let prom_raw = metadata.promulgation_date.clone();
+    let department = if metadata.department_name.is_empty() {
+        "미상"
+    } else {
+        metadata.department_name.as_str()
+    };
+    let field = if metadata.field.is_empty() {
+        "미분류"
+    } else {
+        metadata.field.as_str()
+    };
     let title = format!(
         "{}: {} ({})",
         metadata.law_type, normalized, metadata.amendment
@@ -113,8 +123,8 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String>
     lines.push(String::new());
     lines.push(format!("공포일자: {prom_date}"));
     lines.push(format!("공포번호: {prom_num}"));
-    lines.push(format!("소관부처: {}", metadata.department_name));
-    lines.push(format!("법령분야: {}", metadata.field));
+    lines.push(format!("소관부처: {department}"));
+    lines.push(format!("법령분야: {field}"));
     lines.push(format!("법령MST: {mst}"));
     Ok(lines.join("\n"))
 }
@@ -488,5 +498,21 @@ mod tests {
         let markdown = String::from_utf8(law_to_markdown(&detail).unwrap()).unwrap();
         assert!(markdown.contains("소관부처: []"));
         assert!(!markdown.contains("소관부처:\n- ''"));
+    }
+
+    #[test]
+    fn commit_message_keeps_unknown_department_and_field_fallbacks() {
+        let metadata = LawMetadata {
+            law_name: String::from("테스트법"),
+            law_type: String::from("법률"),
+            promulgation_date: String::from("20240101"),
+            promulgation_number: String::from("00001"),
+            amendment: String::from("일부개정"),
+            ..LawMetadata::default()
+        };
+
+        let message = build_commit_message(&metadata, "1").unwrap();
+        assert!(message.contains("소관부처: 미상"));
+        assert!(message.contains("법령분야: 미분류"));
     }
 }
