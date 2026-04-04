@@ -10,112 +10,185 @@ use flate2::write::ZlibEncoder;
 use openssl::sha;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
+/// Branch name created in every output repository.
 const MAIN_BRANCH: &str = "main";
+/// Fully qualified ref for the output branch tip.
 const MAIN_REF: &str = "refs/heads/main";
+/// Bot author name used for law revision commits.
 const BOT_NAME: &str = "legalize-kr-bot";
+/// Bot author email used for law revision commits.
 const BOT_EMAIL: &str = "bot@legalize.kr";
+/// Author name preserved for the synthetic initial README commit.
 const INITIAL_COMMIT_AUTHOR_NAME: &str = "Junghwan Park";
+/// Author email preserved for the synthetic initial README commit.
 const INITIAL_COMMIT_AUTHOR_EMAIL: &str = "reserve.dev@gmail.com";
+/// Co-author trailers kept on the synthetic initial commit.
 const INITIAL_COMMIT_CO_AUTHORS: &[(&str, &str)] = &[("Jihyeon Kim", "simnalamburt@gmail.com")];
+/// Committer name for the empty contributor marker commit.
 const INITIAL_COMMIT_COMMITTER_NAME: &str = "Jihyeon Kim";
+/// Committer email for the empty contributor marker commit.
 const INITIAL_COMMIT_COMMITTER_EMAIL: &str = "simnalamburt@gmail.com";
+/// Git pack type id for commit objects.
 const PACK_OBJECT_COMMIT: u8 = 1;
+/// Git pack type id for tree objects.
 const PACK_OBJECT_TREE: u8 = 2;
+/// Git pack type id for blob objects.
 const PACK_OBJECT_BLOB: u8 = 3;
+/// Minimum block size indexed when building copy/insert deltas.
 const BLOCK_SIZE: usize = 16;
+/// Step size between indexed source blocks in the delta builder.
 const INDEX_STEP: usize = 16;
 // Small blobs and very different revisions usually lose to the HashMap-heavy delta builder.
+/// Minimum blob size that is worth attempting a delta for.
 const MIN_DELTA_BLOB_BYTES: usize = 128;
+/// Largest allowed size ratio between two revisions before delta building is skipped.
 const MAX_DELTA_BLOB_SIZE_RATIO: usize = 2;
 
+/// Git identity pair used in handcrafted commit objects.
 #[derive(Debug, Clone, Copy)]
 struct GitPerson<'a> {
+    /// Display name in the commit header.
     name: &'a str,
+    /// Email address in the commit header.
     email: &'a str,
 }
 
+/// Commit timestamp with an explicit timezone offset.
 #[derive(Debug, Clone, Copy)]
 struct GitTimestamp {
+    /// Unix timestamp in seconds.
     epoch: i64,
+    /// Timezone offset in minutes east of UTC.
     offset_minutes: i32,
 }
 
+/// One tree entry inside either the root tree or a law group subtree.
 #[derive(Debug, Clone)]
 struct Entry {
+    /// Raw tree entry name bytes.
     name: Vec<u8>,
+    /// Object id pointed to by the tree entry.
     sha: [u8; 20],
+    /// Whether the target object is itself a tree.
     is_tree: bool,
 }
 
+/// Cached state for one `kr/<group>/` subtree.
 #[derive(Debug, Clone)]
 struct Group {
+    /// Directory name below `kr/`.
     name: Vec<u8>,
+    /// Sorted file entries inside that subtree.
     files: Vec<Entry>,
+    /// Most recently materialized subtree SHA.
     cached_sha: Option<[u8; 20]>,
 }
 
+/// Previous blob revision kept as a possible delta base.
 #[derive(Debug, Clone)]
 struct PreviousBlob {
+    /// Object id of the cached base blob.
     sha: [u8; 20],
+    /// Full blob contents used for delta construction.
     content: Vec<u8>,
 }
 
+/// Root-tree entry kinds that can be patched in-place in the cached bytes.
 #[derive(Debug, Clone, Copy)]
 enum DirtyRootEntry {
+    /// One root-level file entry changed.
     File(usize),
+    /// The `kr/` subtree entry changed.
     Kr,
 }
 
+/// Parsed repository path split into the supported root and `kr/` layouts.
 #[derive(Debug)]
 enum RepoPath<'a> {
+    /// Root-level repository file such as `README.md`.
     RootFile(&'a str),
-    KrFile { group: &'a str, filename: &'a str },
+    /// Law Markdown file under `kr/<group>/<filename>.md`.
+    KrFile {
+        /// Parent law directory name below `kr/`.
+        group: &'a str,
+        /// Leaf Markdown filename inside the group directory.
+        filename: &'a str,
+    },
 }
 
+/// Cached root-tree bytes plus patch metadata for repeated commits.
 #[derive(Debug, Default)]
 struct RootTreeState {
+    /// Sorted root-level file entries.
     files: Vec<Entry>,
+    /// Serialized root tree bytes reused across commits.
     cache: Vec<u8>,
+    /// SHA byte offsets for each root file entry.
     sha_offsets: Vec<usize>,
+    /// SHA byte offset for the optional `kr/` subtree entry.
     kr_sha_offset: Option<usize>,
+    /// Most recent root-tree entry that changed.
     dirty_entry: Option<DirtyRootEntry>,
+    /// Most recently written root tree SHA.
     current_sha: Option<[u8; 20]>,
 }
 
+/// Cached `kr/` subtree bytes plus per-group lookup metadata.
 #[derive(Debug, Default)]
 struct KrTreeState {
+    /// Sorted law groups below `kr/`.
     groups: Vec<Group>,
+    /// Fast lookup from group name to its position in `groups`.
     group_indices: HashMap<Vec<u8>, usize>,
+    /// Serialized `kr/` tree bytes reused across commits.
     cache: Vec<u8>,
+    /// SHA byte offsets for each group entry inside `cache`.
     sha_offsets: Vec<usize>,
+    /// Most recently written `kr/` tree SHA.
     current_sha: Option<[u8; 20]>,
+    /// Whether group insertion changed the `kr/` tree layout.
     structure_dirty: bool,
+    /// Group index whose subtree SHA changed most recently.
     dirty_group_index: Option<usize>,
 }
 
+/// Low-level writer that streams raw packfile entries before final assembly.
 struct PackWriter {
     // Object payloads are buffered separately so finish() can stream a final pack
     // header with the real object count instead of patching bytes in place.
+    /// Temporary body stream containing pack entries without the final header.
     body_file: BufWriter<File>,
+    /// Filesystem path of the temporary pack body stream.
     body_path: PathBuf,
+    /// Number of unique objects appended to the pack body.
     object_count: u32,
+    /// Final `.pack` destination path inside the temporary bare repo.
     path: PathBuf,
+    /// Object ids already emitted into the pack stream.
     seen: HashSet<[u8; 20]>,
 }
 
 /// Writes the generated law history into a fresh bare Git repository.
 pub struct BareRepoWriter {
+    /// Streaming pack writer used for all objects in the temporary repo.
     writer: PackWriter,
+    /// Temporary bare repository path populated before the final rename.
     temp_output: PathBuf,
+    /// Requested output path for the finished bare repository.
     final_output: PathBuf,
 
     // Root-level files plus the cached serialized root tree used for REF_DELTA updates.
+    /// Root-tree cache and patch metadata.
     root: RootTreeState,
 
     // Blob and subtree history that lets repeated law revisions reuse previous objects.
+    /// Previous blob bodies keyed by repository path.
     prev_blobs: HashMap<String, PreviousBlob>,
+    /// `kr/` subtree cache and patch metadata.
     kr: KrTreeState,
+    /// Parent commit id for the next handcrafted commit object.
     parent_commit: Option<[u8; 20]>,
+    /// Whether a tree update must be materialized before the next commit.
     tree_dirty: bool,
 }
 
@@ -275,6 +348,7 @@ impl BareRepoWriter {
         Ok(())
     }
 
+    /// Commits one file change after updating blob and tree state.
     fn commit_file(
         &mut self,
         path: &str,
@@ -382,6 +456,7 @@ impl BareRepoWriter {
         Ok(())
     }
 
+    /// Returns the stable sorted group slot for `kr/<group>/`, inserting it if needed.
     fn ensure_group(&mut self, name: &[u8]) -> usize {
         if let Some(&index) = self.kr.group_indices.get(name) {
             return index;
@@ -409,6 +484,7 @@ impl BareRepoWriter {
         position
     }
 
+    /// Materializes and returns the current root tree object id.
     fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
         //
         // Refresh per-group subtree SHAs only for groups whose file set changed.
@@ -560,6 +636,7 @@ impl BareRepoWriter {
         Ok(root_sha)
     }
 
+    /// Serializes and appends one commit object to the pack stream.
     fn write_commit(
         &mut self,
         tree: [u8; 20],
@@ -590,6 +667,7 @@ impl BareRepoWriter {
 }
 
 impl PackWriter {
+    /// Creates a new pack writer that buffers entry bodies in a temporary file.
     fn new(path: &Path) -> Result<Self> {
         let body_path = path.with_extension("pack.body");
         let body_file = BufWriter::with_capacity(1 << 20, File::create(&body_path)?);
@@ -602,6 +680,7 @@ impl PackWriter {
         })
     }
 
+    /// Appends one full object to the pack unless it was already emitted.
     fn write_object(&mut self, object_type: u8, data: &[u8]) -> Result<[u8; 20]> {
         //
         // Hash first so repeated trees/blobs/commits can be skipped entirely in the pack stream.
@@ -620,6 +699,7 @@ impl PackWriter {
         Ok(sha)
     }
 
+    /// Appends one `REF_DELTA` object to the pack unless the result id already exists.
     fn write_ref_delta(
         &mut self,
         base_sha: [u8; 20],
@@ -638,6 +718,7 @@ impl PackWriter {
         Ok(result_sha)
     }
 
+    /// Writes the final pack header and trailer checksum around the buffered body stream.
     fn finish(&mut self) -> Result<()> {
         //
         // Assemble the final pack in one streamed pass so finish() does not reread the whole file.
@@ -683,12 +764,14 @@ impl PackWriter {
         Ok(())
     }
 
+    /// Writes raw bytes into the temporary pack body stream.
     fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
         self.body_file.write_all(bytes)?;
         Ok(())
     }
 
     #[inline]
+    /// Encodes the variable-length PACK entry header for one object payload.
     fn write_pack_entry_header(&mut self, object_type: u8, size: usize) -> Result<()> {
         let mut header = ((object_type & 0b111) << 4) | (size as u8 & 0x0f);
         let mut remaining = size >> 4;
@@ -708,6 +791,7 @@ impl PackWriter {
     }
 }
 
+/// Derives a process-specific temporary output path next to the final repo.
 fn make_temp_output_path(output: &Path) -> Result<PathBuf> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let name = output
@@ -717,6 +801,7 @@ fn make_temp_output_path(output: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{name}.tmp-{}", process::id())))
 }
 
+/// Initializes the temporary bare repository, preferring reftable refs when available.
 fn init_bare_repo(repo_dir: &Path) -> Result<()> {
     let mut init_reftable = git_command();
     init_reftable
@@ -756,6 +841,7 @@ fn init_bare_repo(repo_dir: &Path) -> Result<()> {
     }
 }
 
+/// Creates a Git command with user config disabled for deterministic behavior.
 fn git_command() -> Command {
     let mut command = Command::new("git");
     command.env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -765,6 +851,7 @@ fn git_command() -> Command {
     command
 }
 
+/// Converts a failed Git subprocess result into a rich error.
 fn ensure_command_success(output: Output, context: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
@@ -786,6 +873,7 @@ fn ensure_command_success(output: Output, context: &str) -> Result<()> {
     )
 }
 
+/// Appends `Co-authored-by` trailers to a commit message.
 fn append_co_author_trailers(message: &str, co_authors: &[(&str, &str)]) -> String {
     if co_authors.is_empty() {
         return message.to_owned();
@@ -806,6 +894,7 @@ fn append_co_author_trailers(message: &str, co_authors: &[(&str, &str)]) -> Stri
     rendered
 }
 
+/// Rejects empty repository paths before they reach tree-update logic.
 fn ensure_repo_path(path: &str) -> Result<()> {
     if path.split('/').find(|part| !part.is_empty()).is_none() {
         bail!("invalid empty repository path");
@@ -813,6 +902,7 @@ fn ensure_repo_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Deletes a file or directory tree at `path`.
 fn remove_path(path: &Path) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -824,6 +914,7 @@ fn remove_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Inserts or updates one sorted tree entry and returns its index plus insertion status.
 fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) -> (usize, bool) {
     match entries.iter().position(|entry| entry.name == name) {
         Some(index) => {
@@ -845,6 +936,7 @@ fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) -
     }
 }
 
+/// Serializes a tree object body from already sorted entries.
 fn tree_bytes(entries: &[Entry]) -> Vec<u8> {
     let mut tree = Vec::new();
     for entry in entries {
@@ -856,6 +948,7 @@ fn tree_bytes(entries: &[Entry]) -> Vec<u8> {
     tree
 }
 
+/// Compares tree entries using Git's filename ordering, including tree slash semantics.
 fn tree_sort_cmp(
     left: &(&[u8], [u8; 20], bool),
     right: &(&[u8], [u8; 20], bool),
@@ -873,6 +966,7 @@ fn tree_sort_cmp(
     }
 }
 
+/// Compresses one pack payload with the current fast zlib setting.
 fn compress(data: &[u8]) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder
@@ -881,6 +975,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("zlib finish on Vec cannot fail")
 }
 
+/// Builds a Git copy/insert delta from `src` to `dst`.
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
     //
     // Index fixed-size source blocks so destination scanning can prefer copy commands.
@@ -938,6 +1033,7 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
     delta
 }
 
+/// Builds a tiny copy/insert delta that swaps a single 20-byte SHA inside a cached tree.
 fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Vec<u8> {
     // Tree delta updates only swap one 20-byte SHA, so they can be expressed as copy/insert/copy.
     let mut delta = Vec::with_capacity(64);
@@ -960,6 +1056,7 @@ fn make_copy_insert_delta(total: usize, offset: usize, new_sha: &[u8; 20]) -> Ve
     delta
 }
 
+/// Emits one Git delta copy instruction.
 fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
     // PACK copy opcodes only encode the non-zero bytes of the offset and size fields.
     let mut command = 0x80;
@@ -996,6 +1093,7 @@ fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
     out.extend_from_slice(&args);
 }
 
+/// Hashes one fixed-size block for delta index lookup.
 fn block_hash(data: &[u8]) -> u32 {
     let mut hash = 0x811c9dc5u32;
     for &byte in data {
@@ -1005,6 +1103,7 @@ fn block_hash(data: &[u8]) -> u32 {
     hash
 }
 
+/// Returns the byte length of the common run starting at the two offsets.
 fn match_length(src: &[u8], src_offset: usize, dst: &[u8], dst_offset: usize) -> usize {
     let max = std::cmp::min(src.len() - src_offset, dst.len() - dst_offset);
     let mut len = 0usize;
@@ -1014,6 +1113,7 @@ fn match_length(src: &[u8], src_offset: usize, dst: &[u8], dst_offset: usize) ->
     len
 }
 
+/// Emits literal insert commands, chunked to Git's 127-byte opcode limit.
 fn emit_inserts(out: &mut Vec<u8>, data: &[u8]) {
     let mut offset = 0usize;
     while offset < data.len() {
@@ -1024,6 +1124,7 @@ fn emit_inserts(out: &mut Vec<u8>, data: &[u8]) {
     }
 }
 
+/// Flushes buffered literal bytes into insert commands.
 fn flush_inserts(out: &mut Vec<u8>, pending: &mut Vec<u8>) {
     if !pending.is_empty() {
         emit_inserts(out, pending);
@@ -1031,6 +1132,7 @@ fn flush_inserts(out: &mut Vec<u8>, pending: &mut Vec<u8>) {
     }
 }
 
+/// Encodes one Git-style little-endian base-128 integer.
 fn encode_varint(out: &mut Vec<u8>, mut value: usize) {
     while value >= 128 {
         out.push((value & 0x7f) as u8 | 0x80);
@@ -1039,6 +1141,7 @@ fn encode_varint(out: &mut Vec<u8>, mut value: usize) {
     out.push(value as u8);
 }
 
+/// Computes the canonical Git object id for one unhashed object body.
 fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
     let mut hasher = sha::Sha1::new();
     // Avoid allocating a header string in this hot hash path.
@@ -1062,6 +1165,7 @@ fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
     hasher.finish()
 }
 
+/// Maps a pack object type id to its Git object header name.
 fn object_type_name(object_type: u8) -> &'static [u8] {
     match object_type {
         PACK_OBJECT_COMMIT => b"commit",
@@ -1071,6 +1175,7 @@ fn object_type_name(object_type: u8) -> &'static [u8] {
     }
 }
 
+/// Hex-encodes one object id for commit bodies and Git subprocess arguments.
 fn hex(sha: &[u8; 20]) -> String {
     let mut encoded = String::with_capacity(40);
     for byte in sha {
@@ -1080,6 +1185,7 @@ fn hex(sha: &[u8; 20]) -> String {
     encoded
 }
 
+/// Formats a numeric timezone offset as `+0900`.
 fn format_timezone_offset(offset_minutes: i32) -> String {
     let sign = if offset_minutes < 0 { '-' } else { '+' };
     let total_minutes = offset_minutes.abs();
@@ -1088,6 +1194,7 @@ fn format_timezone_offset(offset_minutes: i32) -> String {
     format!("{sign}{hours:02}{minutes:02}")
 }
 
+/// Converts a promulgation date into the deterministic noon-KST commit timestamp.
 fn commit_time(promulgation_date: &str) -> Result<GitTimestamp> {
     let effective_date = if promulgation_date.len() == 8
         && promulgation_date.bytes().all(|byte| byte.is_ascii_digit())

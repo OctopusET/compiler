@@ -92,14 +92,19 @@ pub struct LawDetail {
     pub addenda: Vec<Addendum>,
 }
 
+/// Minimal DOM node used for the full pass-2 XML walk.
 #[derive(Debug, Clone)]
 struct XmlNode {
+    /// Decoded element name.
     name: String,
+    /// Concatenated text and CDATA body for this node.
     text: String,
+    /// Child elements in source order.
     children: Vec<XmlNode>,
 }
 
 impl XmlNode {
+    /// Creates an empty node for the named XML element.
     fn new(name: String) -> Self {
         Self {
             name,
@@ -108,6 +113,7 @@ impl XmlNode {
         }
     }
 
+    /// Returns the direct child text for the first matching element name.
     fn child_text(&self, name: &str) -> String {
         self.children
             .iter()
@@ -116,6 +122,7 @@ impl XmlNode {
             .unwrap_or_default()
     }
 
+    /// Returns the first descendant text for the requested element name.
     fn descendant_text(&self, name: &str) -> String {
         if self.name == name {
             return self.text.clone();
@@ -131,6 +138,7 @@ impl XmlNode {
         String::new()
     }
 
+    /// Collects every descendant node whose element name matches `name`.
     fn collect_descendants<'a>(&'a self, name: &str, out: &mut Vec<&'a XmlNode>) {
         if self.name == name {
             out.push(self);
@@ -355,10 +363,12 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
     Ok(detail)
 }
 
+/// Decodes one XML element name from UTF-8 bytes.
 fn decode_name(name: &[u8]) -> Result<String> {
     Ok(std::str::from_utf8(name)?.to_owned())
 }
 
+/// Decodes and unescapes one XML text node.
 fn decode_text(text: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(text)?;
     Ok(unescape(text)?.into_owned())

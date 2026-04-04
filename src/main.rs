@@ -4,9 +4,13 @@
 //! metadata is collected and stably sorted first, then each XML document is
 //! fully parsed, rendered to Markdown, and committed into a new bare repo.
 #![deny(missing_docs)]
+#![deny(clippy::missing_docs_in_private_items)]
 
+/// Writes the output bare repository and handcrafted packfile stream.
 mod git_repo;
+/// Renders parsed law data into Markdown and commit messages.
 mod render;
+/// Parses cached XML documents into metadata and article structures.
 mod xml_parser;
 
 use std::cmp::Ordering;
@@ -23,8 +27,10 @@ use crate::git_repo::BareRepoWriter;
 use crate::render::{PathRegistry, build_commit_message, law_to_markdown};
 use crate::xml_parser::{LawMetadata, parse_law_detail, parse_metadata_only};
 
+/// Bundled README payload for the synthetic initial commit.
 const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
 
+/// Command-line interface for one-shot cache compilation.
 #[derive(Debug, Parser)]
 #[command(name = "legalize-kr-compiler")]
 #[command(about = "Compile cached law.go.kr XML/JSON into a fresh bare Git repository")]
@@ -37,25 +43,37 @@ struct Cli {
     output: PathBuf,
 }
 
+/// Amendment metadata loaded from cached history JSON.
 #[derive(Debug, Deserialize)]
 struct HistoryEntry {
+    /// Law MST key that matches the detail XML filename.
     #[serde(rename = "법령일련번호")]
     mst: String,
+    /// Human-readable amendment type applied to that revision.
     #[serde(rename = "제개정구분명", default)]
     amendment: String,
 }
 
+/// Pass-1 planning record for one XML document.
 #[derive(Debug, Clone)]
 struct PlannedEntry {
+    /// Law MST used for file lookup and stable ordering.
     mst: String,
+    /// Final repository path assigned after collision handling.
     path: String,
+    /// Metadata collected during the cheap planning pass.
     metadata: LawMetadata,
 }
 
+/// Fully rendered pass-2 output that is ready to commit.
 struct Rendered {
+    /// Destination repository path for the Markdown file.
     path: String,
+    /// Final Markdown bytes stored in Git.
     markdown: Vec<u8>,
+    /// Commit message for this revision.
     message: String,
+    /// Promulgation date reused for timestamp generation.
     promulgation_date: String,
 }
 
@@ -63,13 +81,16 @@ struct Rendered {
  * Parsed/rendered chunks stay around 1.4 GiB here, while larger chunks grow memory
  * without materially improving throughput on the real cache workload.
  */
+/// Number of entries rendered per worker batch before the writer catches up.
 const CHUNK_SIZE: usize = 500;
 
+/// Parses CLI flags and runs the compiler.
 fn main() -> Result<()> {
     let cli = Cli::parse();
     run(cli)
 }
 
+/// Executes the full two-pass cache-to-Git compilation pipeline.
 fn run(cli: Cli) -> Result<()> {
     let cache_dir = cli.cache_dir;
     let detail_dir = cache_dir.join("detail");
@@ -280,6 +301,7 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Parses, renders, and packages one planned XML entry for pass 2.
 fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
     // Pass 2 does the expensive XML parse only after pass 1 has fixed the final order and path.
     let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
@@ -299,6 +321,7 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
     })
 }
 
+/// Lists files with the requested extension in deterministic path order.
 fn read_sorted_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for item in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {

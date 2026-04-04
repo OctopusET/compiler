@@ -7,11 +7,13 @@ use serde::Serialize;
 
 use crate::xml_parser::{LawDetail, LawMetadata};
 
+/// Child-law suffixes that share a parent directory in the output tree.
 const CHILD_SUFFIXES: [(&str, &str); 2] = [(" 시행규칙", "시행규칙"), (" 시행령", "시행령")];
 
 #[derive(Debug, Default)]
 /// Tracks already-assigned output paths so collisions follow the legacy rules.
 pub struct PathRegistry {
+    /// Already assigned paths keyed by the final repository path.
     assigned: HashMap<String, (String, String)>,
 }
 
@@ -318,6 +320,7 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
     Ok(format!("---\n{yaml}---\n\n{body}\n").into_bytes())
 }
 
+/// Collapses repeated spaces and tabs for rendered list items.
 fn normalize_ws(text: &str) -> String {
     static INSTANCE: OnceLock<Regex> = OnceLock::new();
     INSTANCE
@@ -327,40 +330,57 @@ fn normalize_ws(text: &str) -> String {
         .to_owned()
 }
 
+/// YAML frontmatter payload for one rendered Markdown file.
 #[derive(Debug, Serialize)]
 struct Frontmatter {
+    /// Display title used as the Markdown heading and `제목`.
     #[serde(rename = "제목")]
     title: String,
+    /// MST identifier kept numeric when possible for legacy parity.
     #[serde(rename = "법령MST")]
     mst: ScalarValue,
+    /// Stable law.go.kr law identifier.
     #[serde(rename = "법령ID")]
     law_id: String,
+    /// Human-readable law type such as `법률`.
     #[serde(rename = "법령구분")]
     law_type: String,
+    /// Machine law type code from the XML payload.
     #[serde(rename = "법령구분코드")]
     law_type_code: String,
+    /// Responsible departments split into a YAML list.
     #[serde(rename = "소관부처")]
     departments: Vec<String>,
+    /// Normalized promulgation date.
     #[serde(rename = "공포일자")]
     promulgation_date: String,
+    /// Promulgation number string from the source XML.
     #[serde(rename = "공포번호")]
     promulgation_number: String,
+    /// Normalized enforcement date.
     #[serde(rename = "시행일자")]
     enforcement_date: String,
+    /// Law field/category label.
     #[serde(rename = "법령분야")]
     field: String,
+    /// Rendered enforcement status.
     #[serde(rename = "상태")]
     status: String,
+    /// Canonical law.go.kr source URL.
     #[serde(rename = "출처")]
     source: String,
+    /// Original unnormalized title when punctuation had to be rewritten.
     #[serde(rename = "원본제목", skip_serializing_if = "Option::is_none")]
     original_title: Option<String>,
 }
 
+/// Scalar YAML value that keeps MST numeric when possible.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ScalarValue {
+    /// Numeric MST representation.
     Number(u64),
+    /// String fallback when MST is not parseable as an integer.
     String(String),
 }
 
