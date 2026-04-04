@@ -73,6 +73,9 @@ pub fn format_date(date: &str) -> String {
 
 /// Builds the Git commit message for one law revision.
 pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
+    //
+    // Normalize display text and fill the same fallback labels the legacy pipeline used.
+    //
     let normalized = normalize_law_name(&metadata.law_name);
     let compact = normalized.replace(' ', "");
     let departments = if metadata.department_name.is_empty() {
@@ -94,9 +97,15 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
         title.push_str(&format!(" ({})", metadata.amendment));
     }
 
+    //
+    // Assemble the law.go.kr links that appear at the top of every commit message.
+    //
     let url_law = format!("https://www.law.go.kr/법령/{compact}");
     let url_diff = format!("https://www.law.go.kr/법령/신구법비교/{compact}");
 
+    //
+    // Emit the final line-oriented message body in the historical repository format.
+    //
     let mut lines = vec![title, String::new()];
     lines.push(format!("법령 전문: {url_law}"));
     if !prom_num.is_empty() {
@@ -116,7 +125,9 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
 
 /// Renders one parsed law document into the repository Markdown format.
 pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
+    //
     // Render YAML from the same metadata fields the Python pipeline emits.
+    //
     let frontmatter = {
         let raw_name = detail.metadata.law_name.clone();
         let normalized = normalize_law_name(&raw_name);
@@ -152,6 +163,9 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
         yaml = stripped.to_owned();
     }
 
+    //
+    // Build the Markdown body from the normalized law title and article structure.
+    //
     let normalized_name = normalize_law_name(&detail.metadata.law_name);
     let mut body_parts = vec![format!("# {normalized_name}"), String::new()];
 
@@ -178,7 +192,9 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
             INSTANCE.get_or_init(|| Regex::new(r"^[가-힣](?:의\d+)?\.\s*").unwrap())
         };
 
-        // Keep the Python-style article/paragraph/list formatting so output stays comparable.
+        //
+        // Keep the Python-style article, paragraph, subparagraph, and item formatting intact.
+        //
         for article in &detail.articles {
             let number = &article.number;
             let title = &article.title;
@@ -269,6 +285,9 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
         body_parts.push(articles);
     }
 
+    //
+    // Append addenda after the main body, trimming only indentation noise from CDATA blocks.
+    //
     if !detail.addenda.is_empty() {
         body_parts.push(String::from("## 부칙"));
         body_parts.push(String::new());

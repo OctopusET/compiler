@@ -188,7 +188,14 @@ impl BareRepoWriter {
     /// Creates a new temporary bare repository writer for the requested output path.
     pub fn create(output: &Path) -> Result<Self> {
         let final_output = output.to_path_buf();
-        let temp_output = make_temp_output_path(output)?;
+        let temp_output = {
+            let parent = output.parent().unwrap_or_else(|| Path::new("."));
+            let name = output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("invalid output path: {}", output.display()))?;
+            parent.join(format!(".{name}.tmp-{}", process::id()))
+        };
         if temp_output.exists() {
             remove_path(&temp_output)?;
         }
@@ -228,24 +235,12 @@ impl BareRepoWriter {
         message: &str,
         promulgation_date: &str,
     ) -> Result<()> {
-        const BOT_NAME: &str = "legalize-kr-bot";
-        const BOT_EMAIL: &str = "bot@legalize.kr";
-
+        let bot = GitPerson {
+            name: "legalize-kr-bot",
+            email: "bot@legalize.kr",
+        };
         let time = commit_time(promulgation_date)?;
-        self.commit_file(
-            path,
-            markdown,
-            message,
-            GitPerson {
-                name: BOT_NAME,
-                email: BOT_EMAIL,
-            },
-            GitPerson {
-                name: BOT_NAME,
-                email: BOT_EMAIL,
-            },
-            time,
-        )
+        self.commit_file(path, markdown, message, bot, bot, time)
     }
 
     /// Commits a static repository file with the fixed initial authorship metadata.
@@ -257,8 +252,12 @@ impl BareRepoWriter {
         epoch: i64,
         offset_minutes: i32,
     ) -> Result<()> {
-        let message =
-            append_co_author_trailers(message, &[("Jihyeon Kim", "simnalamburt@gmail.com")]);
+        let message = {
+            let mut rendered = String::from(message.trim_end());
+            rendered.push_str("\n\n");
+            rendered.push_str("Co-authored-by: Jihyeon Kim <simnalamburt@gmail.com>");
+            rendered
+        };
         let author = GitPerson {
             name: "Junghwan Park",
             email: "reserve.dev@gmail.com",
@@ -357,7 +356,9 @@ impl BareRepoWriter {
         //
         // Store the file body first, preferably as a delta against the previous revision.
         //
-        ensure_repo_path(path)?;
+        if path.split('/').all(|part| part.is_empty()) {
+            bail!("invalid empty repository path");
+        }
         let blob_sha = git_hash(PackObjectKind::Blob.git_type_name(), content);
         if let Some(previous) = self.prev_blobs.get(path) {
             let previous_len = previous.content.len();
@@ -644,7 +645,13 @@ impl BareRepoWriter {
         time: GitTimestamp,
     ) -> Result<[u8; 20]> {
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
-        let tz = format_timezone_offset(time.offset_minutes);
+        let tz = {
+            let sign = if time.offset_minutes < 0 { '-' } else { '+' };
+            let total_minutes = time.offset_minutes.abs();
+            let hours = total_minutes / 60;
+            let minutes = total_minutes % 60;
+            format!("{sign}{hours:02}{minutes:02}")
+        };
         let mut commit = format!("tree {}\n", hex(&tree));
         if let Some(parent) = self.parent_commit {
             commit.push_str(&format!("parent {}\n", hex(&parent)));
@@ -789,16 +796,6 @@ impl PackWriter {
     }
 }
 
-/// Derives a process-specific temporary output path next to the final repo.
-fn make_temp_output_path(output: &Path) -> Result<PathBuf> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("invalid output path: {}", output.display()))?;
-    Ok(parent.join(format!(".{name}.tmp-{}", process::id())))
-}
-
 /// Initializes the temporary bare repository, preferring reftable refs when available.
 fn init_bare_repo(repo_dir: &Path) -> Result<()> {
     const MAIN_BRANCH: &str = "main";
@@ -871,35 +868,6 @@ fn ensure_command_success(output: Output, context: &str) -> Result<()> {
             format!("{stderr}\nstdout:\n{stdout}")
         }
     )
-}
-
-/// Appends `Co-authored-by` trailers to a commit message.
-fn append_co_author_trailers(message: &str, co_authors: &[(&str, &str)]) -> String {
-    if co_authors.is_empty() {
-        return message.to_owned();
-    }
-
-    let mut rendered = String::from(message.trim_end());
-    rendered.push_str("\n\n");
-    for (index, (name, email)) in co_authors.iter().enumerate() {
-        if index > 0 {
-            rendered.push('\n');
-        }
-        rendered.push_str("Co-authored-by: ");
-        rendered.push_str(name);
-        rendered.push_str(" <");
-        rendered.push_str(email);
-        rendered.push('>');
-    }
-    rendered
-}
-
-/// Rejects empty repository paths before they reach tree-update logic.
-fn ensure_repo_path(path: &str) -> Result<()> {
-    if path.split('/').find(|part| !part.is_empty()).is_none() {
-        bail!("invalid empty repository path");
-    }
-    Ok(())
 }
 
 /// Deletes a file or directory tree at `path`.
@@ -977,8 +945,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
 
 /// Builds a Git copy/insert delta from `src` to `dst`.
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
-    /// Minimum block size indexed when building copy/insert deltas.
-    const BLOCK_SIZE: usize = 16;
+    let block_size = 16usize;
 
     //
     // Index fixed-size source blocks so destination scanning can prefer copy commands.
@@ -987,14 +954,14 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
     encode_varint(&mut delta, src.len());
     encode_varint(&mut delta, dst.len());
 
-    if src.len() < BLOCK_SIZE {
+    if src.len() < block_size {
         emit_inserts(&mut delta, dst);
         return delta;
     }
 
     let mut index = HashMap::<u32, Vec<usize>>::new();
-    for source_offset in (0..src.len().saturating_sub(BLOCK_SIZE - 1)).step_by(16) {
-        let hash = block_hash(&src[source_offset..source_offset + BLOCK_SIZE]);
+    for source_offset in (0..src.len().saturating_sub(block_size - 1)).step_by(block_size) {
+        let hash = block_hash(&src[source_offset..source_offset + block_size]);
         index.entry(hash).or_default().push(source_offset);
     }
 
@@ -1009,8 +976,8 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
         let mut best_len = 0usize;
         let remaining = dst.len() - destination_offset;
 
-        if remaining >= BLOCK_SIZE {
-            let hash = block_hash(&dst[destination_offset..destination_offset + BLOCK_SIZE]);
+        if remaining >= block_size {
+            let hash = block_hash(&dst[destination_offset..destination_offset + block_size]);
             if let Some(candidates) = index.get(&hash) {
                 for &source_offset in candidates {
                     let match_len = match_length(src, source_offset, dst, destination_offset);
@@ -1022,7 +989,7 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
             }
         }
 
-        if best_len >= BLOCK_SIZE {
+        if best_len >= block_size {
             flush_inserts(&mut delta, &mut pending);
             emit_copy(&mut delta, best_source_offset, best_len);
             destination_offset += best_len;
@@ -1176,15 +1143,6 @@ fn hex(sha: &[u8; 20]) -> String {
         write!(encoded, "{byte:02x}").expect("formatting into String cannot fail");
     }
     encoded
-}
-
-/// Formats a numeric timezone offset as `+0900`.
-fn format_timezone_offset(offset_minutes: i32) -> String {
-    let sign = if offset_minutes < 0 { '-' } else { '+' };
-    let total_minutes = offset_minutes.abs();
-    let hours = total_minutes / 60;
-    let minutes = total_minutes % 60;
-    format!("{sign}{hours:02}{minutes:02}")
 }
 
 /// Converts a promulgation date into the deterministic noon-KST commit timestamp.

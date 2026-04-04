@@ -239,6 +239,10 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
 
 /// Parses a full law XML document into the renderer's intermediate structure.
 pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
+    //
+    // Build a tiny DOM first so the later extraction logic can mirror ElementTree-style descendant
+    // lookups without reparsing the byte stream for every field family.
+    //
     let root = {
         let mut reader = Reader::from_reader(xml);
         reader.config_mut().trim_text(false);
@@ -288,6 +292,10 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
 
         root.context("missing XML root")?
     };
+
+    //
+    // Project top-level metadata from the cached DOM into the renderer's metadata shape.
+    //
     let mut detail = LawDetail {
         metadata: LawMetadata {
             mst: mst.to_owned(),
@@ -306,6 +314,9 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
         addenda: Vec::new(),
     };
 
+    //
+    // Walk article, paragraph, subparagraph, and item descendants into the final nested structs.
+    //
     let mut article_nodes = Vec::new();
     root.collect_descendants("조문단위", &mut article_nodes);
     for node in article_nodes {
@@ -352,6 +363,9 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
         detail.articles.push(article);
     }
 
+    //
+    // Collect addenda after the main body so the renderer can append them as a final section.
+    //
     let mut addendum_nodes = Vec::new();
     root.collect_descendants("부칙단위", &mut addendum_nodes);
     for node in addendum_nodes {
