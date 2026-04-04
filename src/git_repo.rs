@@ -10,12 +10,31 @@ use flate2::write::ZlibEncoder;
 use openssl::sha;
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
-/// Git pack type id for commit objects.
-const PACK_OBJECT_COMMIT: u8 = 1;
-/// Git pack type id for tree objects.
-const PACK_OBJECT_TREE: u8 = 2;
-/// Git pack type id for blob objects.
-const PACK_OBJECT_BLOB: u8 = 3;
+/// Supported pack entry kinds emitted by the handcrafted writer.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackObjectKind {
+    /// Full commit object payload.
+    Commit = 1,
+    /// Full tree object payload.
+    Tree = 2,
+    /// Full blob object payload.
+    Blob = 3,
+    /// Delta payload that references a base object id.
+    RefDelta = 7,
+}
+
+impl PackObjectKind {
+    /// Returns the Git object header name for full objects.
+    fn git_type_name(self) -> &'static [u8] {
+        match self {
+            Self::Commit => b"commit",
+            Self::Tree => b"tree",
+            Self::Blob => b"blob",
+            Self::RefDelta => panic!("ref deltas do not have standalone git object headers"),
+        }
+    }
+}
 
 /// Git identity pair used in handcrafted commit objects.
 #[derive(Debug, Clone, Copy)]
@@ -339,7 +358,7 @@ impl BareRepoWriter {
         // Store the file body first, preferably as a delta against the previous revision.
         //
         ensure_repo_path(path)?;
-        let blob_sha = git_hash(object_type_name(PACK_OBJECT_BLOB), content);
+        let blob_sha = git_hash(PackObjectKind::Blob.git_type_name(), content);
         if let Some(previous) = self.prev_blobs.get(path) {
             let previous_len = previous.content.len();
             let current_len = content.len();
@@ -359,13 +378,13 @@ impl BareRepoWriter {
                     self.writer
                         .write_ref_delta(previous.sha, &delta, blob_sha)?;
                 } else {
-                    self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+                    self.writer.write_object(PackObjectKind::Blob, content)?;
                 }
             } else {
-                self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+                self.writer.write_object(PackObjectKind::Blob, content)?;
             }
         } else {
-            self.writer.write_object(PACK_OBJECT_BLOB, content)?;
+            self.writer.write_object(PackObjectKind::Blob, content)?;
         }
         self.prev_blobs.insert(
             path.to_owned(),
@@ -474,7 +493,7 @@ impl BareRepoWriter {
                 continue;
             }
             let tree = tree_bytes(&group.files);
-            let sha = self.writer.write_object(PACK_OBJECT_TREE, &tree)?;
+            let sha = self.writer.write_object(PackObjectKind::Tree, &tree)?;
             group.cached_sha = Some(sha);
         }
 
@@ -502,7 +521,9 @@ impl BareRepoWriter {
                     );
                 }
                 self.kr.structure_dirty = false;
-                let kr_tree_sha = self.writer.write_object(PACK_OBJECT_TREE, &self.kr.cache)?;
+                let kr_tree_sha = self
+                    .writer
+                    .write_object(PackObjectKind::Tree, &self.kr.cache)?;
                 self.kr.current_sha = Some(kr_tree_sha);
                 self.kr.dirty_group_index = None;
                 Some(kr_tree_sha)
@@ -514,19 +535,22 @@ impl BareRepoWriter {
                     .context("missing cached subtree SHA")?;
                 let delta = make_copy_insert_delta(self.kr.cache.len(), sha_offset, &new_group_sha);
                 self.kr.cache[sha_offset..sha_offset + 20].copy_from_slice(&new_group_sha);
-                let kr_tree_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.kr.cache);
+                let kr_tree_sha = git_hash(PackObjectKind::Tree.git_type_name(), &self.kr.cache);
                 if let Some(base_kr_tree_sha) = base_kr_tree_sha {
                     self.writer
                         .write_ref_delta(base_kr_tree_sha, &delta, kr_tree_sha)?;
                 } else {
-                    self.writer.write_object(PACK_OBJECT_TREE, &self.kr.cache)?;
+                    self.writer
+                        .write_object(PackObjectKind::Tree, &self.kr.cache)?;
                 }
                 self.kr.current_sha = Some(kr_tree_sha);
                 Some(kr_tree_sha)
             } else if let Some(kr_tree_sha) = self.kr.current_sha {
                 Some(kr_tree_sha)
             } else {
-                let kr_tree_sha = self.writer.write_object(PACK_OBJECT_TREE, &self.kr.cache)?;
+                let kr_tree_sha = self
+                    .writer
+                    .write_object(PackObjectKind::Tree, &self.kr.cache)?;
                 self.kr.current_sha = Some(kr_tree_sha);
                 Some(kr_tree_sha)
             }
@@ -571,7 +595,7 @@ impl BareRepoWriter {
 
             self.root.dirty_entry = None;
             self.writer
-                .write_object(PACK_OBJECT_TREE, &self.root.cache)?
+                .write_object(PackObjectKind::Tree, &self.root.cache)?
         } else if let Some(dirty) = self.root.dirty_entry.take() {
             let (sha_offset, new_sha) = match dirty {
                 DirtyRootEntry::File(index) => {
@@ -589,20 +613,20 @@ impl BareRepoWriter {
             };
             let delta = make_copy_insert_delta(self.root.cache.len(), sha_offset, &new_sha);
             self.root.cache[sha_offset..sha_offset + 20].copy_from_slice(&new_sha);
-            let root_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.root.cache);
+            let root_sha = git_hash(PackObjectKind::Tree.git_type_name(), &self.root.cache);
             if let Some(base_root_sha) = self.root.current_sha {
                 self.writer
                     .write_ref_delta(base_root_sha, &delta, root_sha)?;
             } else {
                 self.writer
-                    .write_object(PACK_OBJECT_TREE, &self.root.cache)?;
+                    .write_object(PackObjectKind::Tree, &self.root.cache)?;
             }
             root_sha
         } else if let Some(root_sha) = self.root.current_sha {
             root_sha
         } else {
             self.writer
-                .write_object(PACK_OBJECT_TREE, &self.root.cache)?
+                .write_object(PackObjectKind::Tree, &self.root.cache)?
         };
 
         self.root.current_sha = Some(root_sha);
@@ -636,7 +660,7 @@ impl BareRepoWriter {
         commit.push('\n');
         commit.push_str(message);
         self.writer
-            .write_object(PACK_OBJECT_COMMIT, commit.as_bytes())
+            .write_object(PackObjectKind::Commit, commit.as_bytes())
     }
 }
 
@@ -655,11 +679,11 @@ impl PackWriter {
     }
 
     /// Appends one full object to the pack unless it was already emitted.
-    fn write_object(&mut self, object_type: u8, data: &[u8]) -> Result<[u8; 20]> {
+    fn write_object(&mut self, object_type: PackObjectKind, data: &[u8]) -> Result<[u8; 20]> {
         //
         // Hash first so repeated trees/blobs/commits can be skipped entirely in the pack stream.
         //
-        let sha = git_hash(object_type_name(object_type), data);
+        let sha = git_hash(object_type.git_type_name(), data);
         if !self.seen.insert(sha) {
             return Ok(sha);
         }
@@ -685,7 +709,7 @@ impl PackWriter {
         }
 
         // REF_DELTA stores the base object id before the compressed delta payload.
-        self.write_pack_entry_header(7, delta.len())?;
+        self.write_pack_entry_header(PackObjectKind::RefDelta, delta.len())?;
         self.write_raw(&base_sha)?;
         self.write_raw(&compress(delta))?;
         self.object_count += 1;
@@ -746,8 +770,8 @@ impl PackWriter {
 
     #[inline]
     /// Encodes the variable-length PACK entry header for one object payload.
-    fn write_pack_entry_header(&mut self, object_type: u8, size: usize) -> Result<()> {
-        let mut header = ((object_type & 0b111) << 4) | (size as u8 & 0x0f);
+    fn write_pack_entry_header(&mut self, object_type: PackObjectKind, size: usize) -> Result<()> {
+        let mut header = ((object_type as u8 & 0b111) << 4) | (size as u8 & 0x0f);
         let mut remaining = size >> 4;
         if remaining > 0 {
             header |= 0x80;
@@ -1142,16 +1166,6 @@ fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
     hasher.update(&[0]);
     hasher.update(data);
     hasher.finish()
-}
-
-/// Maps a pack object type id to its Git object header name.
-fn object_type_name(object_type: u8) -> &'static [u8] {
-    match object_type {
-        PACK_OBJECT_COMMIT => b"commit",
-        PACK_OBJECT_TREE => b"tree",
-        PACK_OBJECT_BLOB => b"blob",
-        _ => panic!("invalid object type {object_type}"),
-    }
 }
 
 /// Hex-encodes one object id for commit bodies and Git subprocess arguments.
