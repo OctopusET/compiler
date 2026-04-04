@@ -151,6 +151,10 @@ impl XmlNode {
 
 /// Parses only the metadata fields needed for pass-1 ordering and path planning.
 pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
+    //
+    // Pass 1 only needs `<기본정보>`, so keep the scan shallow and stop as soon as that section
+    // closes instead of paying for the full DOM build used in pass 2.
+    //
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
 
@@ -173,7 +177,10 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
                 if tag == "기본정보" {
                     in_basic_info = true;
                 }
-                // Mirror the Python search path by only capturing the first matching basic-info field.
+                //
+                // Mirror the Python search path by only capturing the first matching basic-info
+                // field, leaving later duplicates untouched.
+                //
                 let should_capture = in_basic_info
                     && match tag.as_str() {
                         "법령명_한글" => metadata.law_name.is_empty(),
@@ -193,6 +200,10 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
             }
             Event::Empty(event) => {
                 let tag = decode_name(event.name().as_ref())?;
+                //
+                // `<기본정보 />` is technically possible, and once the metadata section is over the
+                // remaining XML cannot affect pass-1 ordering or path assignment.
+                //
                 if tag == "기본정보" {
                     break;
                 }
@@ -225,6 +236,10 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
                     }
                     capture_tag = None;
                 }
+                //
+                // The ordering pass intentionally stops after the first metadata block instead of
+                // scanning articles, addenda, or later repeated fields.
+                //
                 if tag == "기본정보" {
                     break;
                 }

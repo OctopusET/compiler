@@ -20,7 +20,10 @@ pub struct PathRegistry {
 impl PathRegistry {
     /// Returns the Markdown path for a law name/type pair.
     pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> String {
-        // Keep the existing repo layout where 시행령/시행규칙 live under the parent law directory.
+        //
+        // Keep the existing repo layout where 시행령/시행규칙 live under the parent law
+        // directory instead of getting their own top-level group names.
+        //
         let (group, filename) = {
             let normalized = normalize_law_name(law_name);
             let child_path = CHILD_SUFFIXES.iter().find_map(|(suffix, filename)| {
@@ -34,6 +37,11 @@ impl PathRegistry {
                 (normalized.replace(' ', ""), law_type.to_owned())
             }
         };
+
+        //
+        // Reuse the plain `<group>/<filename>.md` path when the law name/type pair matches the
+        // previous claimant; otherwise append `(법종)` exactly like the legacy repository did.
+        //
         let base = format!("kr/{group}/{filename}.md");
         if let Some(existing) = self.assigned.get(&base)
             && existing != &(law_name.to_owned(), law_type.to_owned())

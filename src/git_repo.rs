@@ -474,7 +474,21 @@ impl BareRepoWriter {
             if group.cached_sha.is_some() {
                 continue;
             }
-            let tree = tree_bytes(&group.files);
+            //
+            // Group subtrees are only needed here, right before their SHA is refreshed. Keep the
+            // serialization local so the byte layout is visible at the call site where it matters:
+            // `100644/40000`, filename, NUL, then the child object id.
+            //
+            let tree = {
+                let mut tree = Vec::new();
+                for entry in &group.files {
+                    tree.extend_from_slice(if entry.is_tree { b"40000 " } else { b"100644 " });
+                    tree.extend_from_slice(&entry.name);
+                    tree.push(0);
+                    tree.extend_from_slice(&entry.sha);
+                }
+                tree
+            };
             let sha = self.writer.write_object(PackObjectKind::Tree, &tree)?;
             group.cached_sha = Some(sha);
         }
@@ -556,8 +570,22 @@ impl BareRepoWriter {
             if let Some(kr_tree) = kr_tree {
                 root_entries.push((None, b"kr".as_slice(), kr_tree, true));
             }
+            //
+            // Root-tree entries must follow Git's special tree ordering where directories sort
+            // as though their names ended with `/`, not with a NUL terminator like files.
+            //
             root_entries.sort_by(|left, right| {
-                tree_sort_cmp(&(left.1, left.2, left.3), &(right.1, right.2, right.3))
+                let common = left.1.len().min(right.1.len());
+                match left.1[..common].cmp(&right.1[..common]) {
+                    std::cmp::Ordering::Equal => {
+                        let left_tail = if left.3 { b'/' } else { 0 };
+                        let right_tail = if right.3 { b'/' } else { 0 };
+                        let left_next = left.1.get(common).copied().unwrap_or(left_tail);
+                        let right_next = right.1.get(common).copied().unwrap_or(right_tail);
+                        left_next.cmp(&right_next)
+                    }
+                    other => other,
+                }
             });
 
             for (kind, name, sha, is_tree) in root_entries {
@@ -774,6 +802,11 @@ impl PackWriter {
 fn init_bare_repo(repo_dir: &Path) -> Result<()> {
     const MAIN_BRANCH: &str = "main";
 
+    //
+    // Prefer reftable when the local Git is new enough, because the generated repository is
+    // append-only and benefits from avoiding loose ref files. Keep a plain-files fallback so the
+    // compiler still runs on older Git builds that do not understand `--ref-format=reftable`.
+    //
     let mut init_reftable = git_command();
     init_reftable
         .arg("init")
@@ -875,36 +908,6 @@ fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) -
             );
             (index, true)
         }
-    }
-}
-
-/// Serializes a tree object body from already sorted entries.
-fn tree_bytes(entries: &[Entry]) -> Vec<u8> {
-    let mut tree = Vec::new();
-    for entry in entries {
-        tree.extend_from_slice(if entry.is_tree { b"40000 " } else { b"100644 " });
-        tree.extend_from_slice(&entry.name);
-        tree.push(0);
-        tree.extend_from_slice(&entry.sha);
-    }
-    tree
-}
-
-/// Compares tree entries using Git's filename ordering, including tree slash semantics.
-fn tree_sort_cmp(
-    left: &(&[u8], [u8; 20], bool),
-    right: &(&[u8], [u8; 20], bool),
-) -> std::cmp::Ordering {
-    let common = left.0.len().min(right.0.len());
-    match left.0[..common].cmp(&right.0[..common]) {
-        std::cmp::Ordering::Equal => {
-            let left_tail = if left.2 { b'/' } else { 0 };
-            let right_tail = if right.2 { b'/' } else { 0 };
-            let left_next = left.0.get(common).copied().unwrap_or(left_tail);
-            let right_next = right.0.get(common).copied().unwrap_or(right_tail);
-            left_next.cmp(&right_next)
-        }
-        other => other,
     }
 }
 
@@ -1121,6 +1124,10 @@ fn hex(sha: &[u8; 20]) -> String {
 
 /// Converts a promulgation date into the deterministic noon-KST commit timestamp.
 fn commit_time(promulgation_date: &str) -> Result<GitTimestampKst> {
+    //
+    // Normalize both `YYYYMMDD` and `YYYY-MM-DD` forms into the canonical date string the
+    // historical pipeline implicitly used when deriving commit timestamps.
+    //
     let effective_date = if promulgation_date.len() == 8
         && promulgation_date.bytes().all(|byte| byte.is_ascii_digit())
     {
@@ -1134,6 +1141,10 @@ fn commit_time(promulgation_date: &str) -> Result<GitTimestampKst> {
         promulgation_date.to_owned()
     };
 
+    //
+    // Clamp malformed inputs and pre-epoch dates before conversion so reruns keep producing the
+    // same commit ids even when upstream metadata is incomplete or predates Unix time.
+    //
     let effective_date = if effective_date.len() != 10 {
         String::from("2000-01-01")
     } else if effective_date.as_str() < "1970-01-01" {
@@ -1142,6 +1153,10 @@ fn commit_time(promulgation_date: &str) -> Result<GitTimestampKst> {
         effective_date
     };
 
+    //
+    // Every revision commit lands at noon KST. The fixed wall-clock time keeps hashes stable while
+    // still rendering as a readable calendar date in Git history.
+    //
     let year = effective_date[0..4].parse::<i32>()?;
     let month = effective_date[5..7].parse::<u8>()?;
     let day = effective_date[8..10].parse::<u8>()?;
