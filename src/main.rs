@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::git_repo::BareRepoWriter;
@@ -43,6 +44,19 @@ struct PlannedEntry {
     path: String,
     metadata: LawMetadata,
 }
+
+struct Rendered {
+    path: String,
+    markdown: Vec<u8>,
+    message: String,
+    promulgation_date: String,
+}
+
+/*
+ * Parsed/rendered chunks stay around 1.4 GiB here, while larger chunks grow memory
+ * without materially improving throughput on the real cache workload.
+ */
+const CHUNK_SIZE: usize = 500;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -186,32 +200,75 @@ fn run(cli: Cli) -> Result<()> {
     )?;
     eprintln!("  committed contributor marker");
 
-    for (index, entry) in entries.iter().enumerate() {
-        let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
-        let xml = fs::read(&xml_path)
-            .with_context(|| format!("failed to read {}", xml_path.display()))?;
-        let mut detail = parse_law_detail(&xml, &entry.mst)
-            .with_context(|| format!("failed to parse {}", xml_path.display()))?;
-        detail.metadata.amendment = entry.metadata.amendment.clone();
+    let total = entries.len();
+    let chunks: Vec<&[PlannedEntry]> = entries.chunks(CHUNK_SIZE).collect();
+    let mut pending: Option<Vec<Result<Rendered>>> = None;
+    let mut committed = 0usize;
 
-        let markdown = law_to_markdown(&detail)?;
-        let commit_message = build_commit_message(&detail.metadata, &entry.mst);
-        repo.commit_law(
-            &entry.path,
-            &markdown,
-            &commit_message,
-            &detail.metadata.promulgation_date,
-        )
-        .with_context(|| format!("failed to commit MST {}", entry.mst))?;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let detail_dir = detail_dir.to_path_buf();
+        let next = if index + 1 < chunks.len() {
+            let next_chunk: Vec<PlannedEntry> = chunks[index + 1].to_vec();
+            let next_detail_dir = detail_dir.clone();
+            Some(std::thread::spawn(move || {
+                next_chunk
+                    .par_iter()
+                    .map(|entry| render_entry(&next_detail_dir, entry))
+                    .collect::<Vec<_>>()
+            }))
+        } else {
+            None
+        };
 
-        if (index + 1) % 500 == 0 || index + 1 == entries.len() {
-            eprintln!("  committed {}/{}", index + 1, entries.len());
+        let rendered = if let Some(previous) = pending.take() {
+            previous
+        } else {
+            chunk
+                .par_iter()
+                .map(|entry| render_entry(&detail_dir, entry))
+                .collect::<Vec<_>>()
+        };
+
+        for rendered in rendered {
+            let rendered = rendered?;
+            repo.commit_law(
+                &rendered.path,
+                &rendered.markdown,
+                &rendered.message,
+                &rendered.promulgation_date,
+            )?;
+            committed += 1;
+            if committed.is_multiple_of(500) || committed == total {
+                eprintln!("  committed {committed}/{total}");
+            }
+        }
+
+        if let Some(handle) = next {
+            pending = Some(handle.join().expect("render worker panicked"));
         }
     }
 
     repo.finish()?;
     eprintln!("done");
     Ok(())
+}
+
+fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
+    let xml_path = detail_dir.join(format!("{}.xml", entry.mst));
+    let xml =
+        fs::read(&xml_path).with_context(|| format!("failed to read {}", xml_path.display()))?;
+    let mut detail = parse_law_detail(&xml, &entry.mst)
+        .with_context(|| format!("failed to parse {}", xml_path.display()))?;
+    detail.metadata.amendment = entry.metadata.amendment.clone();
+
+    let markdown = law_to_markdown(&detail)?;
+    let message = build_commit_message(&detail.metadata, &entry.mst);
+    Ok(Rendered {
+        path: entry.path.clone(),
+        markdown,
+        message,
+        promulgation_date: detail.metadata.promulgation_date,
+    })
 }
 
 fn read_sorted_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
