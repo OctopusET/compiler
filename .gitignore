@@ -1,4 +1,7 @@
 /target
 
+# Ignore input
+/.cache/
 # Ignore output
 /output.git/
+/.output.git.tmp-*/
