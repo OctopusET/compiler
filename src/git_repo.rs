@@ -51,10 +51,43 @@ struct Group {
     cached_sha: Option<[u8; 20]>,
 }
 
+#[derive(Debug, Clone)]
+struct PreviousBlob {
+    sha: [u8; 20],
+    content: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DirtyRootEntry {
     File(usize),
     Kr,
+}
+
+#[derive(Debug)]
+enum RepoPath<'a> {
+    RootFile(&'a str),
+    KrFile { group: &'a str, filename: &'a str },
+}
+
+#[derive(Debug, Default)]
+struct RootTreeState {
+    files: Vec<Entry>,
+    cache: Vec<u8>,
+    sha_offsets: Vec<usize>,
+    kr_sha_offset: Option<usize>,
+    dirty_entry: Option<DirtyRootEntry>,
+    current_sha: Option<[u8; 20]>,
+}
+
+#[derive(Debug, Default)]
+struct KrTreeState {
+    groups: Vec<Group>,
+    group_indices: HashMap<Vec<u8>, usize>,
+    cache: Vec<u8>,
+    sha_offsets: Vec<usize>,
+    current_sha: Option<[u8; 20]>,
+    structure_dirty: bool,
+    dirty_group_index: Option<usize>,
 }
 
 struct PackWriter {
@@ -74,23 +107,12 @@ pub struct BareRepoWriter {
     final_output: PathBuf,
 
     // Root-level files plus the cached serialized root tree used for REF_DELTA updates.
-    root_files: Vec<Entry>,
-    root_tree_cache: Vec<u8>,
-    root_tree_sha_offsets: Vec<usize>,
-    root_tree_kr_sha_offset: Option<usize>,
-    dirty_root_entry: Option<DirtyRootEntry>,
+    root: RootTreeState,
 
     // Blob and subtree history that lets repeated law revisions reuse previous objects.
-    prev_blobs: HashMap<String, ([u8; 20], Vec<u8>)>,
-    groups: Vec<Group>,
-    group_indices: HashMap<Vec<u8>, usize>,
-    kr_tree_cache: Vec<u8>,
-    kr_tree_sha_offsets: Vec<usize>,
-    current_kr_tree_sha: Option<[u8; 20]>,
-    kr_tree_structure_dirty: bool,
-    dirty_group_index: Option<usize>,
+    prev_blobs: HashMap<String, PreviousBlob>,
+    kr: KrTreeState,
     parent_commit: Option<[u8; 20]>,
-    current_root_sha: Option<[u8; 20]>,
     tree_dirty: bool,
 }
 
@@ -122,21 +144,10 @@ impl BareRepoWriter {
             writer: PackWriter::new(&pack_path)?,
             temp_output,
             final_output,
-            root_files: Vec::new(),
-            root_tree_cache: Vec::new(),
-            root_tree_sha_offsets: Vec::new(),
-            root_tree_kr_sha_offset: None,
-            dirty_root_entry: None,
+            root: RootTreeState::default(),
             prev_blobs: HashMap::new(),
-            groups: Vec::new(),
-            group_indices: HashMap::new(),
-            kr_tree_cache: Vec::new(),
-            kr_tree_sha_offsets: Vec::new(),
-            current_kr_tree_sha: None,
-            kr_tree_structure_dirty: false,
-            dirty_group_index: None,
+            kr: KrTreeState::default(),
             parent_commit: None,
-            current_root_sha: None,
             tree_dirty: false,
         })
     }
@@ -275,53 +286,68 @@ impl BareRepoWriter {
         //
         ensure_repo_path(path)?;
         let blob_sha = git_hash(object_type_name(PACK_OBJECT_BLOB), content);
-        if let Some((base_sha, base_content)) = self.prev_blobs.get(path) {
-            let delta = create_delta(base_content, content);
+        if let Some(previous) = self.prev_blobs.get(path) {
+            let delta = create_delta(&previous.content, content);
             if delta.len() < content.len() * 3 / 4 {
-                self.writer.write_ref_delta(*base_sha, &delta, blob_sha)?;
+                self.writer
+                    .write_ref_delta(previous.sha, &delta, blob_sha)?;
             } else {
                 self.writer.write_object(PACK_OBJECT_BLOB, content)?;
             }
         } else {
             self.writer.write_object(PACK_OBJECT_BLOB, content)?;
         }
-        self.prev_blobs
-            .insert(path.to_owned(), (blob_sha, content.to_vec()));
+        self.prev_blobs.insert(
+            path.to_owned(),
+            PreviousBlob {
+                sha: blob_sha,
+                content: content.to_vec(),
+            },
+        );
 
         //
         // Update the logical tree state for either a root file or a kr/<group>/<file> leaf.
         //
-        match path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            [name] => {
-                let (index, inserted) =
-                    upsert(&mut self.root_files, name.as_bytes(), blob_sha, false);
-                if inserted {
-                    self.root_tree_sha_offsets.clear();
-                    self.root_tree_kr_sha_offset = None;
-                    self.dirty_root_entry = None;
-                } else {
-                    self.dirty_root_entry = Some(DirtyRootEntry::File(index));
+        let repo_path = {
+            let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+            match (
+                segments.next(),
+                segments.next(),
+                segments.next(),
+                segments.next(),
+            ) {
+                (Some(name), None, None, None) => RepoPath::RootFile(name),
+                (Some("kr"), Some(group), Some(filename), None) => {
+                    RepoPath::KrFile { group, filename }
                 }
-                self.dirty_group_index = None;
+                _ => bail!("unsupported repository path: {path}"),
             }
-            ["kr", group, filename] => {
+        };
+        match repo_path {
+            RepoPath::RootFile(name) => {
+                let (index, inserted) =
+                    upsert(&mut self.root.files, name.as_bytes(), blob_sha, false);
+                if inserted {
+                    self.root.sha_offsets.clear();
+                    self.root.kr_sha_offset = None;
+                    self.root.dirty_entry = None;
+                } else {
+                    self.root.dirty_entry = Some(DirtyRootEntry::File(index));
+                }
+                self.kr.dirty_group_index = None;
+            }
+            RepoPath::KrFile { group, filename } => {
                 let group_index = self.ensure_group(group.as_bytes());
                 upsert(
-                    &mut self.groups[group_index].files,
+                    &mut self.kr.groups[group_index].files,
                     filename.as_bytes(),
                     blob_sha,
                     false,
                 );
-                self.groups[group_index].cached_sha = None;
-                self.dirty_group_index = Some(group_index);
-                self.dirty_root_entry = Some(DirtyRootEntry::Kr);
+                self.kr.groups[group_index].cached_sha = None;
+                self.kr.dirty_group_index = Some(group_index);
+                self.root.dirty_entry = Some(DirtyRootEntry::Kr);
             }
-            _ => bail!("unsupported repository path: {path}"),
         }
 
         //
@@ -335,14 +361,15 @@ impl BareRepoWriter {
     }
 
     fn ensure_group(&mut self, name: &[u8]) -> usize {
-        if let Some(&index) = self.group_indices.get(name) {
+        if let Some(&index) = self.kr.group_indices.get(name) {
             return index;
         }
 
         let position = self
+            .kr
             .groups
             .partition_point(|group| group.name.as_slice() < name);
-        self.groups.insert(
+        self.kr.groups.insert(
             position,
             Group {
                 name: name.to_vec(),
@@ -350,13 +377,13 @@ impl BareRepoWriter {
                 cached_sha: None,
             },
         );
-        for index in self.group_indices.values_mut() {
+        for index in self.kr.group_indices.values_mut() {
             if *index >= position {
                 *index += 1;
             }
         }
-        self.group_indices.insert(name.to_vec(), position);
-        self.kr_tree_structure_dirty = true;
+        self.kr.group_indices.insert(name.to_vec(), position);
+        self.kr.structure_dirty = true;
         position
     }
 
@@ -365,12 +392,12 @@ impl BareRepoWriter {
         // Refresh per-group subtree SHAs only for groups whose file set changed.
         //
         if !self.tree_dirty
-            && let Some(sha) = self.current_root_sha
+            && let Some(sha) = self.root.current_sha
         {
             return Ok(sha);
         }
 
-        for group in &mut self.groups {
+        for group in &mut self.kr.groups {
             if group.cached_sha.is_some() {
                 continue;
             }
@@ -382,59 +409,53 @@ impl BareRepoWriter {
         //
         // Rebuild or patch the cached kr/ tree, then remember its current object SHA.
         //
-        let kr_tree = if self.groups.is_empty() {
-            self.kr_tree_cache.clear();
-            self.kr_tree_sha_offsets.clear();
-            self.current_kr_tree_sha = None;
-            self.kr_tree_structure_dirty = false;
-            self.dirty_group_index = None;
+        let kr_tree = if self.kr.groups.is_empty() {
+            self.kr.cache.clear();
+            self.kr.sha_offsets.clear();
+            self.kr.current_sha = None;
+            self.kr.structure_dirty = false;
+            self.kr.dirty_group_index = None;
             None
         } else {
-            if self.kr_tree_structure_dirty || self.kr_tree_sha_offsets.len() != self.groups.len() {
-                self.kr_tree_cache.clear();
-                self.kr_tree_sha_offsets.clear();
-                for group in &self.groups {
-                    self.kr_tree_cache.extend_from_slice(b"40000 ");
-                    self.kr_tree_cache.extend_from_slice(&group.name);
-                    self.kr_tree_cache.push(0);
-                    self.kr_tree_sha_offsets.push(self.kr_tree_cache.len());
-                    self.kr_tree_cache.extend_from_slice(
+            if self.kr.structure_dirty || self.kr.sha_offsets.len() != self.kr.groups.len() {
+                self.kr.cache.clear();
+                self.kr.sha_offsets.clear();
+                for group in &self.kr.groups {
+                    self.kr.cache.extend_from_slice(b"40000 ");
+                    self.kr.cache.extend_from_slice(&group.name);
+                    self.kr.cache.push(0);
+                    self.kr.sha_offsets.push(self.kr.cache.len());
+                    self.kr.cache.extend_from_slice(
                         &group.cached_sha.context("missing cached subtree SHA")?,
                     );
                 }
-                self.kr_tree_structure_dirty = false;
-                let kr_tree_sha = self
-                    .writer
-                    .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
-                self.current_kr_tree_sha = Some(kr_tree_sha);
-                self.dirty_group_index = None;
+                self.kr.structure_dirty = false;
+                let kr_tree_sha = self.writer.write_object(PACK_OBJECT_TREE, &self.kr.cache)?;
+                self.kr.current_sha = Some(kr_tree_sha);
+                self.kr.dirty_group_index = None;
                 Some(kr_tree_sha)
-            } else if let Some(index) = self.dirty_group_index.take() {
-                let base_kr_tree_sha = self.current_kr_tree_sha;
-                let sha_offset = self.kr_tree_sha_offsets[index];
-                let new_group_sha = self.groups[index]
+            } else if let Some(index) = self.kr.dirty_group_index.take() {
+                let base_kr_tree_sha = self.kr.current_sha;
+                let sha_offset = self.kr.sha_offsets[index];
+                let new_group_sha = self.kr.groups[index]
                     .cached_sha
                     .context("missing cached subtree SHA")?;
-                let delta =
-                    make_copy_insert_delta(self.kr_tree_cache.len(), sha_offset, &new_group_sha);
-                self.kr_tree_cache[sha_offset..sha_offset + 20].copy_from_slice(&new_group_sha);
-                let kr_tree_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.kr_tree_cache);
+                let delta = make_copy_insert_delta(self.kr.cache.len(), sha_offset, &new_group_sha);
+                self.kr.cache[sha_offset..sha_offset + 20].copy_from_slice(&new_group_sha);
+                let kr_tree_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.kr.cache);
                 if let Some(base_kr_tree_sha) = base_kr_tree_sha {
                     self.writer
                         .write_ref_delta(base_kr_tree_sha, &delta, kr_tree_sha)?;
                 } else {
-                    self.writer
-                        .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
+                    self.writer.write_object(PACK_OBJECT_TREE, &self.kr.cache)?;
                 }
-                self.current_kr_tree_sha = Some(kr_tree_sha);
+                self.kr.current_sha = Some(kr_tree_sha);
                 Some(kr_tree_sha)
-            } else if let Some(kr_tree_sha) = self.current_kr_tree_sha {
+            } else if let Some(kr_tree_sha) = self.kr.current_sha {
                 Some(kr_tree_sha)
             } else {
-                let kr_tree_sha = self
-                    .writer
-                    .write_object(PACK_OBJECT_TREE, &self.kr_tree_cache)?;
-                self.current_kr_tree_sha = Some(kr_tree_sha);
+                let kr_tree_sha = self.writer.write_object(PACK_OBJECT_TREE, &self.kr.cache)?;
+                self.kr.current_sha = Some(kr_tree_sha);
                 Some(kr_tree_sha)
             }
         };
@@ -442,16 +463,16 @@ impl BareRepoWriter {
         //
         // Rebuild or patch the cached root tree bytes in the same way.
         //
-        let root_structure_dirty = self.root_tree_sha_offsets.len() != self.root_files.len()
-            || self.root_tree_kr_sha_offset.is_some() != kr_tree.is_some();
+        let root_structure_dirty = self.root.sha_offsets.len() != self.root.files.len()
+            || self.root.kr_sha_offset.is_some() != kr_tree.is_some();
         let root_sha = if root_structure_dirty {
-            self.root_tree_cache.clear();
-            self.root_tree_sha_offsets.resize(self.root_files.len(), 0);
-            self.root_tree_kr_sha_offset = None;
+            self.root.cache.clear();
+            self.root.sha_offsets.resize(self.root.files.len(), 0);
+            self.root.kr_sha_offset = None;
 
             let mut root_entries =
-                Vec::with_capacity(self.root_files.len() + usize::from(kr_tree.is_some()));
-            for (index, file) in self.root_files.iter().enumerate() {
+                Vec::with_capacity(self.root.files.len() + usize::from(kr_tree.is_some()));
+            for (index, file) in self.root.files.iter().enumerate() {
                 root_entries.push((Some(index), &file.name[..], file.sha, false));
             }
             if let Some(kr_tree) = kr_tree {
@@ -462,58 +483,57 @@ impl BareRepoWriter {
             });
 
             for (kind, name, sha, is_tree) in root_entries {
-                self.root_tree_cache.extend_from_slice(if is_tree {
-                    b"40000 "
-                } else {
-                    b"100644 "
-                });
-                self.root_tree_cache.extend_from_slice(name);
-                self.root_tree_cache.push(0);
-                let sha_offset = self.root_tree_cache.len();
+                self.root
+                    .cache
+                    .extend_from_slice(if is_tree { b"40000 " } else { b"100644 " });
+                self.root.cache.extend_from_slice(name);
+                self.root.cache.push(0);
+                let sha_offset = self.root.cache.len();
                 if let Some(index) = kind {
-                    self.root_tree_sha_offsets[index] = sha_offset;
+                    self.root.sha_offsets[index] = sha_offset;
                 } else {
-                    self.root_tree_kr_sha_offset = Some(sha_offset);
+                    self.root.kr_sha_offset = Some(sha_offset);
                 }
-                self.root_tree_cache.extend_from_slice(&sha);
+                self.root.cache.extend_from_slice(&sha);
             }
 
-            self.dirty_root_entry = None;
+            self.root.dirty_entry = None;
             self.writer
-                .write_object(PACK_OBJECT_TREE, &self.root_tree_cache)?
-        } else if let Some(dirty) = self.dirty_root_entry.take() {
+                .write_object(PACK_OBJECT_TREE, &self.root.cache)?
+        } else if let Some(dirty) = self.root.dirty_entry.take() {
             let (sha_offset, new_sha) = match dirty {
                 DirtyRootEntry::File(index) => {
-                    let offset = self.root_tree_sha_offsets[index];
-                    (offset, self.root_files[index].sha)
+                    let offset = self.root.sha_offsets[index];
+                    (offset, self.root.files[index].sha)
                 }
                 DirtyRootEntry::Kr => {
                     let offset = self
-                        .root_tree_kr_sha_offset
+                        .root
+                        .kr_sha_offset
                         .context("missing cached root kr offset")?;
                     let sha = kr_tree.context("missing cached kr tree SHA")?;
                     (offset, sha)
                 }
             };
-            let delta = make_copy_insert_delta(self.root_tree_cache.len(), sha_offset, &new_sha);
-            self.root_tree_cache[sha_offset..sha_offset + 20].copy_from_slice(&new_sha);
-            let root_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.root_tree_cache);
-            if let Some(base_root_sha) = self.current_root_sha {
+            let delta = make_copy_insert_delta(self.root.cache.len(), sha_offset, &new_sha);
+            self.root.cache[sha_offset..sha_offset + 20].copy_from_slice(&new_sha);
+            let root_sha = git_hash(object_type_name(PACK_OBJECT_TREE), &self.root.cache);
+            if let Some(base_root_sha) = self.root.current_sha {
                 self.writer
                     .write_ref_delta(base_root_sha, &delta, root_sha)?;
             } else {
                 self.writer
-                    .write_object(PACK_OBJECT_TREE, &self.root_tree_cache)?;
+                    .write_object(PACK_OBJECT_TREE, &self.root.cache)?;
             }
             root_sha
-        } else if let Some(root_sha) = self.current_root_sha {
+        } else if let Some(root_sha) = self.root.current_sha {
             root_sha
         } else {
             self.writer
-                .write_object(PACK_OBJECT_TREE, &self.root_tree_cache)?
+                .write_object(PACK_OBJECT_TREE, &self.root.cache)?
         };
 
-        self.current_root_sha = Some(root_sha);
+        self.root.current_sha = Some(root_sha);
         self.tree_dirty = false;
         Ok(root_sha)
     }
@@ -572,20 +592,7 @@ impl PackWriter {
         //
         // PACK object headers use a variable-length size encoding ahead of the compressed body.
         //
-        let mut header = ((object_type & 0b111) << 4) | (data.len() as u8 & 0x0f);
-        let mut remaining = data.len() >> 4;
-        if remaining > 0 {
-            header |= 0x80;
-        }
-        self.write_raw(&[header])?;
-        while remaining > 0 {
-            let mut byte = (remaining & 0x7f) as u8;
-            remaining >>= 7;
-            if remaining > 0 {
-                byte |= 0x80;
-            }
-            self.write_raw(&[byte])?;
-        }
+        self.write_pack_entry_header(object_type, data.len())?;
         self.write_raw(&compress(data))?;
         self.object_count += 1;
         Ok(sha)
@@ -602,20 +609,7 @@ impl PackWriter {
         }
 
         // REF_DELTA stores the base object id before the compressed delta payload.
-        let mut header = (7u8 << 4) | (delta.len() as u8 & 0x0f);
-        let mut remaining = delta.len() >> 4;
-        if remaining > 0 {
-            header |= 0x80;
-        }
-        self.write_raw(&[header])?;
-        while remaining > 0 {
-            let mut byte = (remaining & 0x7f) as u8;
-            remaining >>= 7;
-            if remaining > 0 {
-                byte |= 0x80;
-            }
-            self.write_raw(&[byte])?;
-        }
+        self.write_pack_entry_header(7, delta.len())?;
         self.write_raw(&base_sha)?;
         self.write_raw(&compress(delta))?;
         self.object_count += 1;
@@ -669,6 +663,25 @@ impl PackWriter {
 
     fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
         self.body_file.write_all(bytes)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_pack_entry_header(&mut self, object_type: u8, size: usize) -> Result<()> {
+        let mut header = ((object_type & 0b111) << 4) | (size as u8 & 0x0f);
+        let mut remaining = size >> 4;
+        if remaining > 0 {
+            header |= 0x80;
+        }
+        self.write_raw(&[header])?;
+        while remaining > 0 {
+            let mut byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+            if remaining > 0 {
+                byte |= 0x80;
+            }
+            self.write_raw(&[byte])?;
+        }
         Ok(())
     }
 }
@@ -1090,15 +1103,26 @@ fn commit_time(promulgation_date: &str) -> Result<GitTimestamp> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use tempfile::TempDir;
 
     use super::*;
 
+    fn output_repo(temp: &TempDir) -> PathBuf {
+        temp.path().join("output.git")
+    }
+
+    fn new_writer(temp: &TempDir) -> (PathBuf, BareRepoWriter) {
+        let output = output_repo(temp);
+        let writer = BareRepoWriter::create(&output).unwrap();
+        (output, writer)
+    }
+
     #[test]
     fn clamps_pre_epoch_dates() {
         let temp = TempDir::new().unwrap();
-        let output = temp.path().join("output.git");
-        let mut writer = BareRepoWriter::create(&output).unwrap();
+        let (output, mut writer) = new_writer(&temp);
         writer
             .commit_law("kr/테스트법/법률.md", b"body", "message", "19491021")
             .unwrap();
@@ -1134,7 +1158,7 @@ mod tests {
         std::env::set_current_dir(previous_dir).unwrap();
         result.unwrap();
 
-        let output = temp.path().join("output.git");
+        let output = output_repo(&temp);
         assert_eq!(
             git_stdout(&output, ["rev-list", "--count", "HEAD"]).trim(),
             "1"
@@ -1144,8 +1168,7 @@ mod tests {
     #[test]
     fn root_tree_delta_handles_root_file_updates() {
         let temp = TempDir::new().unwrap();
-        let output = temp.path().join("output.git");
-        let mut writer = BareRepoWriter::create(&output).unwrap();
+        let (output, mut writer) = new_writer(&temp);
         writer
             .commit_static(
                 "README.md",

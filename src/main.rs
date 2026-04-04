@@ -383,14 +383,18 @@ mod tests {
 </법령>
 "#;
 
+    fn write_sample_xml(detail_dir: &Path, mst: &str, xml: &str) {
+        fs::write(detail_dir.join(format!("{mst}.xml")), xml).unwrap();
+    }
+
     #[test]
     fn plan_entries_sorts_and_assigns_paths() {
         let temp = TempDir::new().unwrap();
         let detail_dir = temp.path().join("detail");
         fs::create_dir_all(&detail_dir).unwrap();
-        fs::write(detail_dir.join("10.xml"), SAMPLE_XML_2).unwrap();
-        fs::write(detail_dir.join("1.xml"), SAMPLE_XML_1).unwrap();
-        fs::write(detail_dir.join("2.xml"), SAMPLE_XML_3).unwrap();
+        write_sample_xml(&detail_dir, "10", SAMPLE_XML_2);
+        write_sample_xml(&detail_dir, "1", SAMPLE_XML_1);
+        write_sample_xml(&detail_dir, "2", SAMPLE_XML_3);
 
         let mut history = HashMap::new();
         history.insert(String::from("1"), String::from("제정"));
@@ -479,8 +483,8 @@ mod tests {
         let history_dir = cache_dir.join("history");
         fs::create_dir_all(&detail_dir).unwrap();
         fs::create_dir_all(&history_dir).unwrap();
-        fs::write(detail_dir.join("1.xml"), SAMPLE_XML_1).unwrap();
-        fs::write(detail_dir.join("2.xml"), SAMPLE_XML_2).unwrap();
+        write_sample_xml(&detail_dir, "1", SAMPLE_XML_1);
+        write_sample_xml(&detail_dir, "2", SAMPLE_XML_2);
         fs::write(
             history_dir.join("테스트법.json"),
             r#"[{"법령일련번호":"1","제개정구분명":"제정"},{"법령일련번호":"2","제개정구분명":"일부개정"}]"#,
