@@ -11,6 +11,31 @@ use crate::xml_parser::{LawDetail, LawMetadata};
 /// Child-law suffixes that share a parent directory in the output tree.
 const CHILD_SUFFIXES: [(&str, &str); 2] = [(" 시행규칙", "시행규칙"), (" 시행령", "시행령")];
 
+/// Derived metadata shared by Markdown rendering and commit-message generation.
+#[derive(Debug)]
+struct PreparedMetadata {
+    /// Normalized law title with legacy punctuation rewrites applied.
+    normalized_name: String,
+    /// Space-stripped title used in law.go.kr URLs.
+    compact_name: String,
+    /// Raw title before normalization for `원본제목`.
+    raw_name: String,
+    /// Promulgation date rendered as `YYYY-MM-DD`.
+    promulgation_date: String,
+    /// Enforcement date rendered as `YYYY-MM-DD`.
+    enforcement_date: String,
+    /// Promulgation number copied from XML metadata.
+    promulgation_number: String,
+    /// Department list for YAML frontmatter.
+    departments: Vec<String>,
+    /// Commit-message department line with the legacy `미상` fallback.
+    commit_department: String,
+    /// Raw field/category label for YAML frontmatter.
+    field: String,
+    /// Commit-message field line with the legacy `미분류` fallback.
+    commit_field: String,
+}
+
 #[derive(Debug, Default)]
 /// Tracks already-assigned output paths so collisions follow the legacy rules.
 pub struct PathRegistry {
@@ -80,40 +105,71 @@ pub fn format_date(date: &str) -> Result<String> {
     Ok(format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8]))
 }
 
+/// Precomputes the normalized metadata view reused across renderer outputs.
+fn prepare_metadata(metadata: &LawMetadata) -> Result<PreparedMetadata> {
+    //
+    // Normalize the law title once and derive the URL-friendly compact title from that same value.
+    //
+    let normalized_name = normalize_law_name(&metadata.law_name);
+    let compact_name = normalized_name.replace(' ', "");
+
+    //
+    // Date formatting and department splitting are shared by commit messages and Markdown
+    // frontmatter, but only commit messages keep the legacy unknown-field fallbacks.
+    //
+    let departments = metadata
+        .department_name
+        .split(',')
+        .map(str::trim)
+        .filter(|department| !department.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    Ok(PreparedMetadata {
+        normalized_name,
+        compact_name,
+        raw_name: metadata.law_name.clone(),
+        promulgation_date: format_date(&metadata.promulgation_date)?,
+        enforcement_date: format_date(&metadata.enforcement_date)?,
+        promulgation_number: metadata.promulgation_number.clone(),
+        commit_department: if metadata.department_name.is_empty() {
+            String::from("미상")
+        } else {
+            metadata.department_name.clone()
+        },
+        departments,
+        field: metadata.field.clone(),
+        commit_field: if metadata.field.is_empty() {
+            String::from("미분류")
+        } else {
+            metadata.field.clone()
+        },
+    })
+}
+
 /// Builds the Git commit message for one law revision.
 pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String> {
     //
     // Normalize display text and project the cache metadata directly into the legacy message shape.
     //
-    let normalized = normalize_law_name(&metadata.law_name);
-    let compact = normalized.replace(' ', "");
-    let prom_date = format_date(&metadata.promulgation_date)?;
-    let prom_num = metadata.promulgation_number.clone();
-    let prom_raw = metadata.promulgation_date.clone();
-    let department = if metadata.department_name.is_empty() {
-        "미상"
-    } else {
-        metadata.department_name.as_str()
-    };
-    let field = if metadata.field.is_empty() {
-        "미분류"
-    } else {
-        metadata.field.as_str()
-    };
+    let prepared = prepare_metadata(metadata)?;
     let title = if metadata.amendment.is_empty() {
-        format!("{}: {}", metadata.law_type, normalized)
+        format!("{}: {}", metadata.law_type, prepared.normalized_name)
     } else {
         format!(
             "{}: {} ({})",
-            metadata.law_type, normalized, metadata.amendment
+            metadata.law_type, prepared.normalized_name, metadata.amendment
         )
     };
 
     //
     // Assemble the law.go.kr links that appear at the top of every commit message.
     //
-    let url_law = format!("https://www.law.go.kr/법령/{compact}");
-    let url_diff = format!("https://www.law.go.kr/법령/신구법비교/{compact}");
+    let url_law = format!("https://www.law.go.kr/법령/{}", prepared.compact_name);
+    let url_diff = format!(
+        "https://www.law.go.kr/법령/신구법비교/{}",
+        prepared.compact_name
+    );
 
     //
     // Emit the final line-oriented message body in the historical repository format.
@@ -121,14 +177,15 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> Result<String>
     let mut lines = vec![title, String::new()];
     lines.push(format!("법령 전문: {url_law}"));
     lines.push(format!(
-        "제개정문: https://www.law.go.kr/법령/제개정문/{compact}/({prom_num},{prom_raw})"
+        "제개정문: https://www.law.go.kr/법령/제개정문/{}/({},{})",
+        prepared.compact_name, prepared.promulgation_number, metadata.promulgation_date
     ));
     lines.push(format!("신구법비교: {url_diff}"));
     lines.push(String::new());
-    lines.push(format!("공포일자: {prom_date}"));
-    lines.push(format!("공포번호: {prom_num}"));
-    lines.push(format!("소관부처: {department}"));
-    lines.push(format!("법령분야: {field}"));
+    lines.push(format!("공포일자: {}", prepared.promulgation_date));
+    lines.push(format!("공포번호: {}", prepared.promulgation_number));
+    lines.push(format!("소관부처: {}", prepared.commit_department));
+    lines.push(format!("법령분야: {}", prepared.commit_field));
     lines.push(format!("법령MST: {mst}"));
     Ok(lines.join("\n"))
 }
@@ -138,33 +195,23 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
     //
     // Render YAML from the same metadata fields the Python pipeline emits.
     //
+    let prepared = prepare_metadata(&detail.metadata)?;
     let frontmatter = {
-        let raw_name = detail.metadata.law_name.clone();
-        let normalized = normalize_law_name(&raw_name);
-
         Frontmatter {
-            title: normalized.clone(),
+            title: prepared.normalized_name.clone(),
             mst: detail.metadata.mst.parse::<u64>()?,
             law_id: detail.metadata.law_id.clone(),
             law_type: detail.metadata.law_type.clone(),
             law_type_code: detail.metadata.law_type_code.clone(),
-            // Keep the legacy empty-list rendering when no department is present instead of
-            // serializing a single empty string item.
-            departments: detail
-                .metadata
-                .department_name
-                .split(',')
-                .map(str::trim)
-                .filter(|department| !department.is_empty())
-                .map(ToOwned::to_owned)
-                .collect(),
-            promulgation_date: format_date(&detail.metadata.promulgation_date)?,
-            promulgation_number: detail.metadata.promulgation_number.clone(),
-            enforcement_date: format_date(&detail.metadata.enforcement_date)?,
-            field: detail.metadata.field.clone(),
+            departments: prepared.departments.clone(),
+            promulgation_date: prepared.promulgation_date.clone(),
+            promulgation_number: prepared.promulgation_number.clone(),
+            enforcement_date: prepared.enforcement_date.clone(),
+            field: prepared.field.clone(),
             status: String::from("시행"),
-            source: format!("https://www.law.go.kr/법령/{}", normalized.replace(' ', "")),
-            original_title: (normalized != raw_name).then_some(raw_name),
+            source: format!("https://www.law.go.kr/법령/{}", prepared.compact_name),
+            original_title: (prepared.normalized_name != prepared.raw_name)
+                .then_some(prepared.raw_name.clone()),
         }
     };
     let mut yaml = serde_yaml::to_string(&frontmatter)?;
@@ -175,8 +222,7 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
     //
     // Build the Markdown body from the normalized law title and article structure.
     //
-    let normalized_name = normalize_law_name(&detail.metadata.law_name);
-    let mut body_parts = vec![format!("# {normalized_name}"), String::new()];
+    let mut body_parts = vec![format!("# {}", prepared.normalized_name), String::new()];
 
     let articles = {
         let mut lines = Vec::new();
@@ -511,6 +557,7 @@ mod tests {
             law_type: String::from("법률"),
             promulgation_date: String::from("20240101"),
             promulgation_number: String::from("00001"),
+            enforcement_date: String::from("20240101"),
             amendment: String::from("일부개정"),
             ..LawMetadata::default()
         };
@@ -527,6 +574,7 @@ mod tests {
             law_type: String::from("법률"),
             promulgation_date: String::from("20240101"),
             promulgation_number: String::from("00001"),
+            enforcement_date: String::from("20240101"),
             amendment: String::new(),
             ..LawMetadata::default()
         };
