@@ -5,25 +5,9 @@ use anyhow::Result;
 use regex::Regex;
 use serde::Serialize;
 
-use crate::xml_parser::{Article, LawDetail, LawMetadata};
+use crate::xml_parser::{LawDetail, LawMetadata};
 
 const CHILD_SUFFIXES: [(&str, &str); 2] = [(" 시행규칙", "시행규칙"), (" 시행령", "시행령")];
-
-fn type_to_filename(law_type: &str) -> &str {
-    match law_type {
-        "헌법" => "헌법",
-        "법률" => "법률",
-        "대통령령" => "대통령령",
-        "총리령" => "총리령",
-        "부령" => "부령",
-        "대법원규칙" => "대법원규칙",
-        "국회규칙" => "국회규칙",
-        "헌법재판소규칙" => "헌법재판소규칙",
-        "감사원규칙" => "감사원규칙",
-        "선거관리위원회규칙" => "선거관리위원회규칙",
-        _ => law_type,
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct PathRegistry {
@@ -32,7 +16,20 @@ pub struct PathRegistry {
 
 impl PathRegistry {
     pub fn get_law_path(&mut self, law_name: &str, law_type: &str) -> String {
-        let (group, filename) = get_group_and_filename(law_name, law_type);
+        // Keep the existing repo layout where 시행령/시행규칙 live under the parent law directory.
+        let (group, filename) = {
+            let normalized = normalize_law_name(law_name);
+            let child_path = CHILD_SUFFIXES.iter().find_map(|(suffix, filename)| {
+                normalized
+                    .strip_suffix(suffix)
+                    .map(|group| (group, *filename))
+            });
+            if let Some((group, filename)) = child_path {
+                (group.replace(' ', ""), filename.to_owned())
+            } else {
+                (normalized.replace(' ', ""), law_type.to_owned())
+            }
+        };
         let base = format!("kr/{group}/{filename}.md");
         if let Some(existing) = self.assigned.get(&base)
             && existing != &(law_name.to_owned(), law_type.to_owned())
@@ -111,7 +108,37 @@ pub fn build_commit_message(metadata: &LawMetadata, mst: &str) -> String {
 }
 
 pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
-    let frontmatter = build_frontmatter(&detail.metadata);
+    // Render YAML from the same metadata fields the Python pipeline emits.
+    let frontmatter = {
+        let raw_name = detail.metadata.law_name.clone();
+        let normalized = normalize_law_name(&raw_name);
+
+        Frontmatter {
+            title: normalized.clone(),
+            mst: match detail.metadata.mst.parse::<u64>() {
+                Ok(number) => ScalarValue::Number(number),
+                Err(_) => ScalarValue::String(detail.metadata.mst.clone()),
+            },
+            law_id: detail.metadata.law_id.clone(),
+            law_type: detail.metadata.law_type.clone(),
+            law_type_code: detail.metadata.law_type_code.clone(),
+            departments: detail
+                .metadata
+                .department_name
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+            promulgation_date: format_date(&detail.metadata.promulgation_date),
+            promulgation_number: detail.metadata.promulgation_number.clone(),
+            enforcement_date: format_date(&detail.metadata.enforcement_date),
+            field: detail.metadata.field.clone(),
+            status: String::from("시행"),
+            source: format!("https://www.law.go.kr/법령/{}", normalized.replace(' ', "")),
+            original_title: (normalized != raw_name).then_some(raw_name),
+        }
+    };
     let mut yaml = serde_yaml::to_string(&frontmatter)?;
     if let Some(stripped) = yaml.strip_prefix("---\n") {
         yaml = stripped.to_owned();
@@ -120,7 +147,116 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
     let normalized_name = normalize_law_name(&detail.metadata.law_name);
     let mut body_parts = vec![format!("# {normalized_name}"), String::new()];
 
-    let articles = articles_to_markdown(&detail.articles);
+    let articles = {
+        let mut lines = Vec::new();
+        let structure_re = {
+            static INSTANCE: OnceLock<Regex> = OnceLock::new();
+            INSTANCE.get_or_init(|| Regex::new(r"^제\d+(?:의\d+)?(편|장|절|관)\s*").unwrap())
+        };
+        let article_prefix_re = {
+            static INSTANCE: OnceLock<Regex> = OnceLock::new();
+            INSTANCE.get_or_init(|| Regex::new(r"^제\d+조(?:의\d+)?\s*(?:\([^)]*\)\s*)?").unwrap())
+        };
+        let circled_prefix_re = {
+            static INSTANCE: OnceLock<Regex> = OnceLock::new();
+            INSTANCE.get_or_init(|| Regex::new(r"^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]\s*").unwrap())
+        };
+        let ho_prefix_re = {
+            static INSTANCE: OnceLock<Regex> = OnceLock::new();
+            INSTANCE.get_or_init(|| Regex::new(r"^\d+(?:의\d+)?\.\s*").unwrap())
+        };
+        let mok_prefix_re = {
+            static INSTANCE: OnceLock<Regex> = OnceLock::new();
+            INSTANCE.get_or_init(|| Regex::new(r"^[가-힣](?:의\d+)?\.\s*").unwrap())
+        };
+
+        // Keep the Python-style article/paragraph/list formatting so output stays comparable.
+        for article in &detail.articles {
+            let number = &article.number;
+            let title = &article.title;
+            let content = normalize_law_name(article.content.trim());
+
+            if title.is_empty()
+                && let Some(captures) = structure_re.captures(&content)
+            {
+                let level = match captures.get(1).map(|m| m.as_str()) {
+                    Some("편") => "#",
+                    Some("장") => "##",
+                    Some("절") => "###",
+                    Some("관") => "####",
+                    _ => "",
+                };
+                if !level.is_empty() {
+                    lines.push(format!("{level} {content}"));
+                    lines.push(String::new());
+                    continue;
+                }
+            }
+
+            let mut heading = format!("##### 제{number}조");
+            if !title.is_empty() {
+                heading.push_str(&format!(" ({title})"));
+            }
+            lines.push(heading);
+            lines.push(String::new());
+
+            if !content.is_empty() {
+                let cleaned = article_prefix_re.replace(&content, "").to_string();
+                if !cleaned.is_empty() {
+                    lines.push(cleaned);
+                    lines.push(String::new());
+                }
+            }
+
+            for paragraph in &article.paragraphs {
+                let content = normalize_law_name(&paragraph.content);
+                if !content.is_empty() {
+                    let stripped = circled_prefix_re.replace(content.trim(), "").to_string();
+                    let prefix = if paragraph.number.is_empty() {
+                        String::new()
+                    } else {
+                        format!("**{}**", paragraph.number)
+                    };
+                    lines.push(format!("{prefix} {stripped}"));
+                    lines.push(String::new());
+                }
+
+                for subparagraph in &paragraph.subparagraphs {
+                    let content = normalize_law_name(&subparagraph.content);
+                    if !content.is_empty() {
+                        let stripped = ho_prefix_re.replace(content.trim(), "").to_string();
+                        let stripped = normalize_ws(&stripped);
+                        let number = subparagraph.number.trim().trim_end_matches('.');
+                        if number.is_empty() {
+                            lines.push(format!("  {stripped}"));
+                        } else {
+                            lines.push(format!("  {number}\\. {stripped}"));
+                        }
+                    }
+
+                    for item in &subparagraph.items {
+                        let content = normalize_law_name(&item.content);
+                        if !content.is_empty() {
+                            let stripped = mok_prefix_re.replace(content.trim(), "").to_string();
+                            let stripped = normalize_ws(&stripped);
+                            let number = item.number.trim().trim_end_matches('.');
+                            if number.is_empty() {
+                                lines.push(format!("    {stripped}"));
+                            } else {
+                                lines.push(format!("    {number}\\. {stripped}"));
+                            }
+                        }
+                    }
+                }
+
+                if !paragraph.subparagraphs.is_empty() {
+                    lines.push(String::new());
+                }
+            }
+        }
+
+        lines.join("\n")
+    };
     if !articles.is_empty() {
         body_parts.push(articles);
     }
@@ -131,7 +267,42 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
         for addendum in &detail.addenda {
             let content = addendum.content.trim();
             if !content.is_empty() {
-                body_parts.push(dedent_content(content));
+                // Addenda often arrive indented as CDATA blocks, so strip common leading padding.
+                let dedented = {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let min_indent = lines
+                        .iter()
+                        .filter_map(|line| {
+                            let stripped = line.trim_start();
+                            if stripped.is_empty() {
+                                None
+                            } else {
+                                let indent = line.len() - stripped.len();
+                                (indent > 0).then_some(indent)
+                            }
+                        })
+                        .min();
+
+                    if let Some(min_indent) = min_indent {
+                        lines
+                            .into_iter()
+                            .map(|line| {
+                                let stripped = line.trim_start();
+                                if stripped.is_empty() {
+                                    String::new()
+                                } else {
+                                    let indent = line.len() - stripped.len();
+                                    let new_indent = indent.saturating_sub(min_indent);
+                                    format!("{}{}", " ".repeat(new_indent), stripped)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        content.to_owned()
+                    }
+                };
+                body_parts.push(dedented);
                 body_parts.push(String::new());
             }
         }
@@ -141,213 +312,13 @@ pub fn law_to_markdown(detail: &LawDetail) -> Result<Vec<u8>> {
     Ok(format!("---\n{yaml}---\n\n{body}\n").into_bytes())
 }
 
-fn get_group_and_filename(law_name: &str, law_type: &str) -> (String, String) {
-    let normalized = normalize_law_name(law_name);
-    for (suffix, filename) in CHILD_SUFFIXES {
-        if let Some(group) = normalized.strip_suffix(suffix) {
-            return (group.replace(' ', ""), filename.to_owned());
-        }
-    }
-
-    (
-        normalized.replace(' ', ""),
-        type_to_filename(law_type).to_owned(),
-    )
-}
-
-fn build_frontmatter(metadata: &LawMetadata) -> Frontmatter {
-    let raw_name = metadata.law_name.clone();
-    let normalized = normalize_law_name(&raw_name);
-
-    Frontmatter {
-        title: normalized.clone(),
-        mst: scalar_from_digits(&metadata.mst),
-        law_id: metadata.law_id.clone(),
-        law_type: metadata.law_type.clone(),
-        law_type_code: metadata.law_type_code.clone(),
-        departments: parse_departments(&metadata.department_name),
-        promulgation_date: format_date(&metadata.promulgation_date),
-        promulgation_number: metadata.promulgation_number.clone(),
-        enforcement_date: format_date(&metadata.enforcement_date),
-        field: metadata.field.clone(),
-        status: String::from("시행"),
-        source: format!("https://www.law.go.kr/법령/{}", normalized.replace(' ', "")),
-        original_title: (normalized != raw_name).then_some(raw_name),
-    }
-}
-
-fn articles_to_markdown(articles: &[Article]) -> String {
-    let mut lines = Vec::new();
-
-    for article in articles {
-        let number = &article.number;
-        let title = &article.title;
-        let content = normalize_law_name(article.content.trim());
-
-        if title.is_empty()
-            && let Some(captures) = structure_re().captures(&content)
-        {
-            let level = match captures.get(1).map(|m| m.as_str()) {
-                Some("편") => "#",
-                Some("장") => "##",
-                Some("절") => "###",
-                Some("관") => "####",
-                _ => "",
-            };
-            if !level.is_empty() {
-                lines.push(format!("{level} {content}"));
-                lines.push(String::new());
-                continue;
-            }
-        }
-
-        let mut heading = format!("##### 제{number}조");
-        if !title.is_empty() {
-            heading.push_str(&format!(" ({title})"));
-        }
-        lines.push(heading);
-        lines.push(String::new());
-
-        if !content.is_empty() {
-            let cleaned = article_prefix_re().replace(&content, "").to_string();
-            if !cleaned.is_empty() {
-                lines.push(cleaned);
-                lines.push(String::new());
-            }
-        }
-
-        for paragraph in &article.paragraphs {
-            let content = normalize_law_name(&paragraph.content);
-            if !content.is_empty() {
-                let stripped = circled_prefix_re().replace(content.trim(), "").to_string();
-                let prefix = if paragraph.number.is_empty() {
-                    String::new()
-                } else {
-                    format!("**{}**", paragraph.number)
-                };
-                lines.push(format!("{prefix} {stripped}"));
-                lines.push(String::new());
-            }
-
-            for subparagraph in &paragraph.subparagraphs {
-                let content = normalize_law_name(&subparagraph.content);
-                if !content.is_empty() {
-                    let stripped = ho_prefix_re().replace(content.trim(), "").to_string();
-                    let stripped = normalize_ws(&stripped);
-                    let number = subparagraph.number.trim().trim_end_matches('.');
-                    if number.is_empty() {
-                        lines.push(format!("  {stripped}"));
-                    } else {
-                        lines.push(format!("  {number}\\. {stripped}"));
-                    }
-                }
-
-                for item in &subparagraph.items {
-                    let content = normalize_law_name(&item.content);
-                    if !content.is_empty() {
-                        let stripped = mok_prefix_re().replace(content.trim(), "").to_string();
-                        let stripped = normalize_ws(&stripped);
-                        let number = item.number.trim().trim_end_matches('.');
-                        if number.is_empty() {
-                            lines.push(format!("    {stripped}"));
-                        } else {
-                            lines.push(format!("    {number}\\. {stripped}"));
-                        }
-                    }
-                }
-            }
-
-            if !paragraph.subparagraphs.is_empty() {
-                lines.push(String::new());
-            }
-        }
-    }
-
-    lines.join("\n")
-}
-
-fn dedent_content(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let min_indent = lines
-        .iter()
-        .filter_map(|line| {
-            let stripped = line.trim_start();
-            if stripped.is_empty() {
-                None
-            } else {
-                let indent = line.len() - stripped.len();
-                (indent > 0).then_some(indent)
-            }
-        })
-        .min();
-
-    let Some(min_indent) = min_indent else {
-        return text.to_owned();
-    };
-
-    lines
-        .into_iter()
-        .map(|line| {
-            let stripped = line.trim_start();
-            if stripped.is_empty() {
-                String::new()
-            } else {
-                let indent = line.len() - stripped.len();
-                let new_indent = indent.saturating_sub(min_indent);
-                format!("{}{}", " ".repeat(new_indent), stripped)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn normalize_ws(text: &str) -> String {
-    whitespace_re().replace_all(text, " ").trim().to_owned()
-}
-
-fn structure_re() -> &'static Regex {
     static INSTANCE: OnceLock<Regex> = OnceLock::new();
-    INSTANCE.get_or_init(|| Regex::new(r"^제\d+(?:의\d+)?(편|장|절|관)\s*").unwrap())
-}
-
-fn article_prefix_re() -> &'static Regex {
-    static INSTANCE: OnceLock<Regex> = OnceLock::new();
-    INSTANCE.get_or_init(|| Regex::new(r"^제\d+조(?:의\d+)?\s*(?:\([^)]*\)\s*)?").unwrap())
-}
-
-fn circled_prefix_re() -> &'static Regex {
-    static INSTANCE: OnceLock<Regex> = OnceLock::new();
-    INSTANCE.get_or_init(|| Regex::new(r"^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]\s*").unwrap())
-}
-
-fn ho_prefix_re() -> &'static Regex {
-    static INSTANCE: OnceLock<Regex> = OnceLock::new();
-    INSTANCE.get_or_init(|| Regex::new(r"^\d+(?:의\d+)?\.\s*").unwrap())
-}
-
-fn mok_prefix_re() -> &'static Regex {
-    static INSTANCE: OnceLock<Regex> = OnceLock::new();
-    INSTANCE.get_or_init(|| Regex::new(r"^[가-힣](?:의\d+)?\.\s*").unwrap())
-}
-
-fn whitespace_re() -> &'static Regex {
-    static INSTANCE: OnceLock<Regex> = OnceLock::new();
-    INSTANCE.get_or_init(|| Regex::new(r"[ \t]+").unwrap())
-}
-
-fn parse_departments(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn scalar_from_digits(value: &str) -> ScalarValue {
-    match value.parse::<u64>() {
-        Ok(number) => ScalarValue::Number(number),
-        Err(_) => ScalarValue::String(value.to_owned()),
-    }
+    INSTANCE
+        .get_or_init(|| Regex::new(r"[ \t]+").unwrap())
+        .replace_all(text, " ")
+        .trim()
+        .to_owned()
 }
 
 #[derive(Debug, Serialize)]
@@ -389,6 +360,7 @@ enum ScalarValue {
 
 #[cfg(test)]
 mod tests {
+    use crate::xml_parser::Article;
     use crate::xml_parser::{Addendum, Paragraph, Subparagraph};
 
     use super::*;

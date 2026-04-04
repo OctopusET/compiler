@@ -130,7 +130,20 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
                 if tag == "기본정보" {
                     in_basic_info = true;
                 }
-                if in_basic_info && should_capture_metadata_tag(&tag, &metadata) {
+                // Mirror the Python search path by only capturing the first matching basic-info field.
+                let should_capture = in_basic_info
+                    && match tag.as_str() {
+                        "법령명_한글" => metadata.law_name.is_empty(),
+                        "법령ID" => metadata.law_id.is_empty(),
+                        "법종구분" => metadata.law_type.is_empty(),
+                        "공포일자" => metadata.promulgation_date.is_empty(),
+                        "공포번호" => metadata.promulgation_number.is_empty(),
+                        "시행일자" => metadata.enforcement_date.is_empty(),
+                        "소관부처명" => metadata.department_name.is_empty(),
+                        "법령분류명" => metadata.field.is_empty(),
+                        _ => false,
+                    };
+                if should_capture {
                     capture_text.clear();
                     capture_tag = Some(tag);
                 }
@@ -156,7 +169,17 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
                 if let Some(current) = &capture_tag
                     && current == &tag
                 {
-                    assign_metadata_field(&mut metadata, current, &capture_text);
+                    match current.as_str() {
+                        "법령명_한글" => metadata.law_name = capture_text.clone(),
+                        "법령ID" => metadata.law_id = capture_text.clone(),
+                        "법종구분" => metadata.law_type = capture_text.clone(),
+                        "공포일자" => metadata.promulgation_date = capture_text.clone(),
+                        "공포번호" => metadata.promulgation_number = capture_text.clone(),
+                        "시행일자" => metadata.enforcement_date = capture_text.clone(),
+                        "소관부처명" => metadata.department_name = capture_text.clone(),
+                        "법령분류명" => metadata.field = capture_text.clone(),
+                        _ => {}
+                    }
                     capture_tag = None;
                 }
                 if tag == "기본정보" {
@@ -172,7 +195,55 @@ pub fn parse_metadata_only(xml: &[u8], mst: &str) -> Result<LawMetadata> {
 }
 
 pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
-    let root = parse_xml_tree(xml)?;
+    let root = {
+        let mut reader = Reader::from_reader(xml);
+        reader.config_mut().trim_text(false);
+
+        let mut buf = Vec::new();
+        let mut stack: Vec<XmlNode> = Vec::new();
+        let mut root = None;
+
+        loop {
+            match reader.read_event_into(&mut buf)? {
+                Event::Start(event) => {
+                    let name = decode_name(event.name().as_ref())?;
+                    stack.push(XmlNode::new(name));
+                }
+                Event::Empty(event) => {
+                    let name = decode_name(event.name().as_ref())?;
+                    let node = XmlNode::new(name);
+                    if let Some(parent) = stack.last_mut() {
+                        parent.children.push(node);
+                    } else {
+                        root = Some(node);
+                    }
+                }
+                Event::Text(text) => {
+                    if let Some(node) = stack.last_mut() {
+                        node.text.push_str(&decode_text(text.as_ref())?);
+                    }
+                }
+                Event::CData(text) => {
+                    if let Some(node) = stack.last_mut() {
+                        node.text.push_str(&String::from_utf8_lossy(text.as_ref()));
+                    }
+                }
+                Event::End(_) => {
+                    let node = stack.pop().context("unexpected end tag")?;
+                    if let Some(parent) = stack.last_mut() {
+                        parent.children.push(node);
+                    } else {
+                        root = Some(node);
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        root.context("missing XML root")?
+    };
     let mut detail = LawDetail {
         metadata: LawMetadata {
             mst: mst.to_owned(),
@@ -246,84 +317,6 @@ pub fn parse_law_detail(xml: &[u8], mst: &str) -> Result<LawDetail> {
     }
 
     Ok(detail)
-}
-
-fn should_capture_metadata_tag(tag: &str, metadata: &LawMetadata) -> bool {
-    match tag {
-        "법령명_한글" => metadata.law_name.is_empty(),
-        "법령ID" => metadata.law_id.is_empty(),
-        "법종구분" => metadata.law_type.is_empty(),
-        "공포일자" => metadata.promulgation_date.is_empty(),
-        "공포번호" => metadata.promulgation_number.is_empty(),
-        "시행일자" => metadata.enforcement_date.is_empty(),
-        "소관부처명" => metadata.department_name.is_empty(),
-        "법령분류명" => metadata.field.is_empty(),
-        _ => false,
-    }
-}
-
-fn assign_metadata_field(metadata: &mut LawMetadata, tag: &str, value: &str) {
-    match tag {
-        "법령명_한글" => metadata.law_name = value.to_owned(),
-        "법령ID" => metadata.law_id = value.to_owned(),
-        "법종구분" => metadata.law_type = value.to_owned(),
-        "공포일자" => metadata.promulgation_date = value.to_owned(),
-        "공포번호" => metadata.promulgation_number = value.to_owned(),
-        "시행일자" => metadata.enforcement_date = value.to_owned(),
-        "소관부처명" => metadata.department_name = value.to_owned(),
-        "법령분류명" => metadata.field = value.to_owned(),
-        _ => {}
-    }
-}
-
-fn parse_xml_tree(xml: &[u8]) -> Result<XmlNode> {
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(false);
-
-    let mut buf = Vec::new();
-    let mut stack: Vec<XmlNode> = Vec::new();
-    let mut root = None;
-
-    loop {
-        match reader.read_event_into(&mut buf)? {
-            Event::Start(event) => {
-                let name = decode_name(event.name().as_ref())?;
-                stack.push(XmlNode::new(name));
-            }
-            Event::Empty(event) => {
-                let name = decode_name(event.name().as_ref())?;
-                let node = XmlNode::new(name);
-                if let Some(parent) = stack.last_mut() {
-                    parent.children.push(node);
-                } else {
-                    root = Some(node);
-                }
-            }
-            Event::Text(text) => {
-                if let Some(node) = stack.last_mut() {
-                    node.text.push_str(&decode_text(text.as_ref())?);
-                }
-            }
-            Event::CData(text) => {
-                if let Some(node) = stack.last_mut() {
-                    node.text.push_str(&String::from_utf8_lossy(text.as_ref()));
-                }
-            }
-            Event::End(_) => {
-                let node = stack.pop().context("unexpected end tag")?;
-                if let Some(parent) = stack.last_mut() {
-                    parent.children.push(node);
-                } else {
-                    root = Some(node);
-                }
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    root.context("missing XML root")
 }
 
 fn decode_name(name: &[u8]) -> Result<String> {

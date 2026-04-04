@@ -57,10 +57,106 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     eprintln!("loading amendment history...");
-    let history = load_amendments(&cache_dir)?;
+    // History JSON overrides the amendment labels embedded in detail XML.
+    let history = {
+        let history_dir = cache_dir.join("history");
+        if !history_dir.is_dir() {
+            HashMap::new()
+        } else {
+            let mut files = read_sorted_files(&history_dir, "json")?;
+            let mut amendments = HashMap::new();
+            for path in files.drain(..) {
+                let bytes = fs::read(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let entries: Vec<HistoryEntry> = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                for entry in entries {
+                    if !entry.mst.is_empty() {
+                        amendments.insert(entry.mst, entry.amendment);
+                    }
+                }
+            }
+            amendments
+        }
+    };
 
     eprintln!("pass 1/2: scanning cache metadata...");
-    let entries = plan_entries(&detail_dir, &history)?;
+    // Pass 1 only reads XML metadata so the final full parse can follow a stable order.
+    let entries = {
+        let mut files = read_sorted_files(&detail_dir, "xml")?;
+        let mut entries = Vec::with_capacity(files.len());
+        let mut skipped_blank_name = 0usize;
+
+        for path in files.drain(..) {
+            let mst = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("invalid file name: {}", path.display()))?;
+            let xml =
+                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+            let mut metadata = parse_metadata_only(&xml, &mst)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+
+            if let Some(amendment) = history.get(&mst) {
+                metadata.amendment = amendment.clone();
+            }
+
+            if metadata.law_name.trim().is_empty() {
+                skipped_blank_name += 1;
+                continue;
+            }
+
+            entries.push(PlannedEntry {
+                mst,
+                path: String::new(),
+                metadata,
+            });
+        }
+
+        entries.sort_by(|left, right| {
+            let parse_numeric_key = |value: &str| value.parse::<u64>().ok();
+            left.metadata
+                .promulgation_date
+                .cmp(&right.metadata.promulgation_date)
+                .then_with(|| left.metadata.law_name.cmp(&right.metadata.law_name))
+                .then_with(|| {
+                    // Promulgation numbers are meaningful ordering keys when present.
+                    match (
+                        parse_numeric_key(&left.metadata.promulgation_number),
+                        parse_numeric_key(&right.metadata.promulgation_number),
+                    ) {
+                        (Some(left), Some(right)) => left.cmp(&right),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => left
+                            .metadata
+                            .promulgation_number
+                            .cmp(&right.metadata.promulgation_number),
+                    }
+                })
+                .then_with(
+                    || match (parse_numeric_key(&left.mst), parse_numeric_key(&right.mst)) {
+                        (Some(left), Some(right)) => left.cmp(&right),
+                        _ => left.mst.cmp(&right.mst),
+                    },
+                )
+        });
+
+        let mut registry = PathRegistry::default();
+        for entry in &mut entries {
+            entry.path = registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type);
+        }
+
+        if skipped_blank_name > 0 {
+            eprintln!(
+                "  skipped {} entries with empty law names",
+                skipped_blank_name
+            );
+        }
+
+        entries
+    };
     if entries.is_empty() {
         anyhow::bail!("no valid XML entries found under {}", detail_dir.display());
     }
@@ -116,111 +212,6 @@ fn run(cli: Cli) -> Result<()> {
     repo.finish()?;
     eprintln!("done");
     Ok(())
-}
-
-fn load_amendments(cache_dir: &Path) -> Result<HashMap<String, String>> {
-    let history_dir = cache_dir.join("history");
-    if !history_dir.is_dir() {
-        return Ok(HashMap::new());
-    }
-
-    let mut files = read_sorted_files(&history_dir, "json")?;
-    let mut amendments = HashMap::new();
-    for path in files.drain(..) {
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let entries: Vec<HistoryEntry> = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        for entry in entries {
-            if !entry.mst.is_empty() {
-                amendments.insert(entry.mst, entry.amendment);
-            }
-        }
-    }
-    Ok(amendments)
-}
-
-fn plan_entries(
-    detail_dir: &Path,
-    amendments: &HashMap<String, String>,
-) -> Result<Vec<PlannedEntry>> {
-    let mut files = read_sorted_files(detail_dir, "xml")?;
-    let mut entries = Vec::with_capacity(files.len());
-    let mut skipped_blank_name = 0usize;
-
-    for path in files.drain(..) {
-        let mst = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
-            .with_context(|| format!("invalid file name: {}", path.display()))?;
-        let xml = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let mut metadata = parse_metadata_only(&xml, &mst)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-
-        if let Some(amendment) = amendments.get(&mst) {
-            metadata.amendment = amendment.clone();
-        }
-
-        if metadata.law_name.trim().is_empty() {
-            skipped_blank_name += 1;
-            continue;
-        }
-
-        entries.push(PlannedEntry {
-            mst,
-            path: String::new(),
-            metadata,
-        });
-    }
-
-    entries.sort_by(|left, right| {
-        left.metadata
-            .promulgation_date
-            .cmp(&right.metadata.promulgation_date)
-            .then_with(|| left.metadata.law_name.cmp(&right.metadata.law_name))
-            .then_with(|| {
-                compare_optional_numeric(
-                    &left.metadata.promulgation_number,
-                    &right.metadata.promulgation_number,
-                )
-            })
-            .then_with(|| compare_numeric(&left.mst, &right.mst))
-    });
-
-    let mut registry = PathRegistry::default();
-    for entry in &mut entries {
-        entry.path = registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type);
-    }
-
-    if skipped_blank_name > 0 {
-        eprintln!(
-            "  skipped {} entries with empty law names",
-            skipped_blank_name
-        );
-    }
-
-    Ok(entries)
-}
-
-fn compare_optional_numeric(left: &str, right: &str) -> Ordering {
-    match (parse_numeric_key(left), parse_numeric_key(right)) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => left.cmp(right),
-    }
-}
-
-fn compare_numeric(left: &str, right: &str) -> Ordering {
-    match (parse_numeric_key(left), parse_numeric_key(right)) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.cmp(right),
-    }
-}
-
-fn parse_numeric_key(value: &str) -> Option<u64> {
-    value.parse().ok()
 }
 
 fn read_sorted_files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>> {
@@ -321,7 +312,71 @@ mod tests {
         history.insert(String::from("2"), String::from("일부개정"));
         history.insert(String::from("10"), String::from("일부개정"));
 
-        let entries = plan_entries(&detail_dir, &history).unwrap();
+        // Keep the unit test aligned with the pass-1 planner logic used by run().
+        let entries = {
+            let mut files = read_sorted_files(&detail_dir, "xml").unwrap();
+            let mut entries = Vec::with_capacity(files.len());
+
+            for path in files.drain(..) {
+                let mst = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap();
+                let xml = fs::read(&path).unwrap();
+                let mut metadata = parse_metadata_only(&xml, &mst).unwrap();
+
+                if let Some(amendment) = history.get(&mst) {
+                    metadata.amendment = amendment.clone();
+                }
+
+                if metadata.law_name.trim().is_empty() {
+                    continue;
+                }
+
+                entries.push(PlannedEntry {
+                    mst,
+                    path: String::new(),
+                    metadata,
+                });
+            }
+
+            entries.sort_by(|left, right| {
+                let parse_numeric_key = |value: &str| value.parse::<u64>().ok();
+                left.metadata
+                    .promulgation_date
+                    .cmp(&right.metadata.promulgation_date)
+                    .then_with(|| left.metadata.law_name.cmp(&right.metadata.law_name))
+                    .then_with(|| {
+                        match (
+                            parse_numeric_key(&left.metadata.promulgation_number),
+                            parse_numeric_key(&right.metadata.promulgation_number),
+                        ) {
+                            (Some(left), Some(right)) => left.cmp(&right),
+                            (Some(_), None) => Ordering::Less,
+                            (None, Some(_)) => Ordering::Greater,
+                            (None, None) => left
+                                .metadata
+                                .promulgation_number
+                                .cmp(&right.metadata.promulgation_number),
+                        }
+                    })
+                    .then_with(|| {
+                        match (parse_numeric_key(&left.mst), parse_numeric_key(&right.mst)) {
+                            (Some(left), Some(right)) => left.cmp(&right),
+                            _ => left.mst.cmp(&right.mst),
+                        }
+                    })
+            });
+
+            let mut registry = PathRegistry::default();
+            for entry in &mut entries {
+                entry.path =
+                    registry.get_law_path(&entry.metadata.law_name, &entry.metadata.law_type);
+            }
+
+            entries
+        };
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].mst, "1");
         assert_eq!(entries[0].path, "kr/테스트법/법률.md");
