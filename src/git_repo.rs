@@ -1,15 +1,19 @@
 use std::fs;
+use std::io::Write;
+use std::mem::{self, ManuallyDrop};
 use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result, anyhow};
-use git2::{Commit, Repository, Signature, Time as GitTime, Tree};
+use git2::{Buf, Commit, Mempack, Odb, Repository, Signature, Time as GitTime, Tree};
 use time::{Date, Month, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 
 const MAIN_REF: &str = "refs/heads/main";
 
 pub struct BareRepoWriter {
     repo: Repository,
+    odb: Odb<'static>,
+    mempack: Mempack<'static>,
     temp_output: PathBuf,
     final_output: PathBuf,
     parent_commit: Option<git2::Oid>,
@@ -33,9 +37,12 @@ impl BareRepoWriter {
         let repo = Repository::init_bare(&temp_output)
             .with_context(|| format!("failed to init bare repo at {}", temp_output.display()))?;
         repo.reference_symbolic("HEAD", MAIN_REF, true, "set HEAD to main")?;
+        let (odb, mempack) = attach_mempack(&repo)?;
 
         Ok(Self {
             repo,
+            odb,
+            mempack,
             temp_output,
             final_output,
             parent_commit: None,
@@ -74,14 +81,9 @@ impl BareRepoWriter {
             .collect::<Vec<Commit>>();
         let parent_refs = parent_commits.iter().collect::<Vec<&Commit>>();
 
-        let commit_oid = self.repo.commit(
-            Some(MAIN_REF),
-            &author,
-            &committer,
-            message,
-            &tree,
-            &parent_refs,
-        )?;
+        let commit_oid =
+            self.repo
+                .commit(None, &author, &committer, message, &tree, &parent_refs)?;
 
         self.parent_commit = Some(commit_oid);
         self.current_tree = Some(tree_oid);
@@ -131,14 +133,9 @@ impl BareRepoWriter {
             .collect::<Vec<Commit>>();
         let parent_refs = parent_commits.iter().collect::<Vec<&Commit>>();
 
-        let commit_oid = self.repo.commit(
-            Some(MAIN_REF),
-            &author,
-            &committer,
-            &message,
-            &tree,
-            &parent_refs,
-        )?;
+        let commit_oid =
+            self.repo
+                .commit(None, &author, &committer, &message, &tree, &parent_refs)?;
 
         self.parent_commit = Some(commit_oid);
         self.current_tree = Some(tree_oid);
@@ -178,14 +175,9 @@ impl BareRepoWriter {
             .collect::<Vec<Commit>>();
         let parent_refs = parent_commits.iter().collect::<Vec<&Commit>>();
 
-        let commit_oid = self.repo.commit(
-            Some(MAIN_REF),
-            &author,
-            &committer,
-            message,
-            &tree,
-            &parent_refs,
-        )?;
+        let commit_oid =
+            self.repo
+                .commit(None, &author, &committer, message, &tree, &parent_refs)?;
 
         self.parent_commit = Some(commit_oid);
         self.current_tree = Some(tree_oid);
@@ -193,6 +185,20 @@ impl BareRepoWriter {
     }
 
     pub fn finish(self) -> Result<()> {
+        if let Some(parent_commit) = self.parent_commit {
+            let mut pack = Buf::new();
+            self.mempack.dump(&self.repo, &mut pack)?;
+
+            let mut packwriter = self.odb.packwriter()?;
+            packwriter.write_all(&pack)?;
+            packwriter.commit()?;
+            self.mempack.reset()?;
+
+            self.repo
+                .reference(MAIN_REF, parent_commit, true, "set main")?;
+            self.repo.set_head(MAIN_REF)?;
+        }
+
         if self.final_output.exists() {
             remove_path(&self.final_output)?;
         }
@@ -205,6 +211,18 @@ impl BareRepoWriter {
         })?;
         Ok(())
     }
+}
+
+fn attach_mempack(repo: &Repository) -> Result<(Odb<'static>, Mempack<'static>)> {
+    let odb = ManuallyDrop::new(repo.odb()?);
+    let mempack = ManuallyDrop::new(odb.add_new_mempack_backend(1000)?);
+
+    // These wrappers only contain raw libgit2 pointers plus lifetime markers.
+    // The writer stores the repository, ODB, and mempack together and drops
+    // them together, so extending the lifetimes here is sound.
+    let odb = unsafe { mem::transmute_copy::<Odb<'_>, Odb<'static>>(&*odb) };
+    let mempack = unsafe { mem::transmute_copy::<Mempack<'_>, Mempack<'static>>(&*mempack) };
+    Ok((odb, mempack))
 }
 
 fn append_co_author_trailers(message: &str, co_authors: &[(&str, &str)]) -> String {

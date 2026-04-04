@@ -360,6 +360,13 @@ mod tests {
         let mut revwalk = repo.revwalk().unwrap();
         revwalk.push_head().unwrap();
         assert_eq!(revwalk.count(), 4);
+        let pack_dir = repo.path().join("objects").join("pack");
+        let pack_count = fs::read_dir(pack_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack"))
+            .count();
+        assert!(pack_count > 0);
 
         let head_commit = head.peel_to_commit().unwrap();
         let contributor_commit = head_commit.parent(0).unwrap().parent(0).unwrap();
