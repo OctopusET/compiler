@@ -285,7 +285,7 @@ impl BareRepoWriter {
         Ok(())
     }
 
-    /// Finalizes the pack, updates `main`, and moves the temporary repo into place.
+    /// Finalizes the pack, writes `main` as loose refs, and moves the temporary repo into place.
     pub fn finish(mut self) -> Result<()> {
         self.writer.finish()?;
 
@@ -300,16 +300,21 @@ impl BareRepoWriter {
         ensure_command_success(output, "git index-pack")?;
 
         if let Some(parent_commit) = self.parent_commit {
-            let output = git_command()
-                .arg("-C")
-                .arg(&self.temp_output)
-                .arg("update-ref")
-                .arg("refs/heads/main")
-                .arg(hex(&parent_commit))
-                .output()
-                .context("failed to run git update-ref")?;
-            ensure_command_success(output, "git update-ref")?;
+            let refs_heads = self.temp_output.join("refs/heads");
+            fs::create_dir_all(&refs_heads)
+                .with_context(|| format!("failed to create {}", refs_heads.display()))?;
+            fs::write(
+                refs_heads.join("main"),
+                format!("{}\n", hex(&parent_commit)),
+            )
+            .with_context(|| format!("failed to write {}", refs_heads.join("main").display()))?;
         }
+        fs::write(self.temp_output.join("HEAD"), "ref: refs/heads/main\n").with_context(|| {
+            format!(
+                "failed to write {}",
+                self.temp_output.join("HEAD").display()
+            )
+        })?;
 
         if self.final_output.exists() {
             remove_path(&self.final_output)?;
@@ -798,51 +803,24 @@ impl PackWriter {
     }
 }
 
-/// Initializes the temporary bare repository, preferring reftable refs when available.
+/// Initializes the temporary bare repository with the standard files ref backend.
 fn init_bare_repo(repo_dir: &Path) -> Result<()> {
     const MAIN_BRANCH: &str = "main";
 
     //
-    // Prefer reftable when the local Git is new enough, because the generated repository is
-    // append-only and benefits from avoiding loose ref files. Keep a plain-files fallback so the
-    // compiler still runs on older Git builds that do not understand `--ref-format=reftable`.
+    // This compiler only writes `HEAD` and `refs/heads/main`, so loose ref files are simpler than
+    // carrying reftable compatibility logic or an extra `git update-ref` subprocess.
     //
-    let mut init_reftable = git_command();
-    init_reftable
+    let output = git_command()
         .arg("init")
         .arg("--quiet")
         .arg("--bare")
         .arg("--initial-branch")
         .arg(MAIN_BRANCH)
-        .arg("--ref-format")
-        .arg("reftable")
-        .arg(repo_dir);
-
-    match init_reftable.output() {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let reftable_stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let mut init_files = git_command();
-            init_files
-                .arg("init")
-                .arg("--quiet")
-                .arg("--bare")
-                .arg("--initial-branch")
-                .arg(MAIN_BRANCH)
-                .arg(repo_dir);
-            let output = init_files
-                .output()
-                .with_context(|| format!("failed to init bare repo at {}", repo_dir.display()))?;
-            ensure_command_success(
-                output,
-                &format!(
-                    "git init --bare fallback failed after reftable init error: {reftable_stderr}"
-                ),
-            )
-        }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to init bare repo at {}", repo_dir.display())),
-    }
+        .arg(repo_dir)
+        .output()
+        .with_context(|| format!("failed to init bare repo at {}", repo_dir.display()))?;
+    ensure_command_success(output, "git init --bare")
 }
 
 /// Creates a Git command with user config disabled for deterministic behavior.
