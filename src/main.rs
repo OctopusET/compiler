@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use serde::Deserialize;
 
-use crate::git_repo::{BareRepoWriter, GitTimestampKst, RepoPathBuf};
+use crate::git_repo::{BareRepoWriter, GitTimestampKst, RepoPathBuf, precompute_blob};
 use crate::render::{PathRegistry, build_commit_message, law_to_markdown};
 use crate::xml_parser::{LawDetail, LawMetadata, parse_law_body, parse_metadata_only};
 
@@ -72,6 +72,10 @@ struct Rendered {
     path: RepoPathBuf,
     /// Final Markdown bytes stored in Git.
     markdown: Vec<u8>,
+    /// Canonical Git blob id for the rendered Markdown.
+    blob_sha: [u8; 20],
+    /// Precompressed PACK payload for the rendered Markdown blob.
+    compressed_blob: Vec<u8>,
     /// Commit message for this revision.
     message: String,
     /// Deterministic KST commit timestamp derived during pass 2.
@@ -302,6 +306,8 @@ fn run(cli: Cli) -> Result<()> {
             repo.commit_law(
                 &rendered.path,
                 &rendered.markdown,
+                rendered.blob_sha,
+                &rendered.compressed_blob,
                 &rendered.message,
                 rendered.time,
             )?;
@@ -337,10 +343,13 @@ fn render_entry(detail_dir: &Path, entry: &PlannedEntry) -> Result<Rendered> {
     let time = GitTimestampKst::from_promulgation_date(&detail.metadata.promulgation_date)?;
 
     let markdown = law_to_markdown(&detail)?;
+    let (blob_sha, compressed_blob) = precompute_blob(&markdown);
     let message = build_commit_message(&detail.metadata, &entry.mst)?;
     Ok(Rendered {
         path: entry.path.clone(),
         markdown,
+        blob_sha,
+        compressed_blob,
         message,
         time,
     })

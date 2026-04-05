@@ -46,6 +46,15 @@ struct GitPerson<'a> {
     email: &'a str,
 }
 
+/// Author/committer identities paired for one handcrafted commit.
+#[derive(Debug, Clone, Copy)]
+struct CommitPeople<'a> {
+    /// Author identity recorded in the commit body.
+    author: GitPerson<'a>,
+    /// Committer identity recorded in the commit body.
+    committer: GitPerson<'a>,
+}
+
 /// Commit timestamp that is always rendered in Korea Standard Time (`+0900`).
 #[derive(Debug, Clone, Copy)]
 pub struct GitTimestampKst {
@@ -96,6 +105,14 @@ impl GitTimestampKst {
             epoch: datetime.assume_offset(offset).unix_timestamp(),
         })
     }
+}
+
+/// Precomputes the canonical blob id and compressed pack payload for one file body.
+pub fn precompute_blob(content: &[u8]) -> ([u8; 20], Vec<u8>) {
+    (
+        git_hash(PackObjectKind::Blob.git_type_name(), content),
+        compress(content),
+    )
 }
 
 /// Owned repository path in either the root or `kr/<group>/` namespace.
@@ -168,6 +185,14 @@ struct PreviousBlob {
     sha: [u8; 20],
     /// Full blob contents used for delta construction.
     content: Vec<u8>,
+}
+
+/// Borrowed blob payload that was already hashed and compressed off the writer hot path.
+struct PrecomputedBlob<'a> {
+    /// Canonical Git object id for the blob body.
+    sha: [u8; 20],
+    /// Deflated PACK payload for the blob body.
+    compressed: &'a [u8],
 }
 
 /// Root-tree entry kinds that can be patched in-place in the cached bytes.
@@ -298,6 +323,8 @@ impl BareRepoWriter {
         &mut self,
         path: &RepoPathBuf,
         markdown: &[u8],
+        blob_sha: [u8; 20],
+        compressed_blob: &[u8],
         message: &str,
         time: GitTimestampKst,
     ) -> Result<()> {
@@ -305,7 +332,21 @@ impl BareRepoWriter {
             name: "legalize-kr-bot",
             email: "bot@legalize.kr",
         };
-        self.commit_file(path, markdown, message, bot, bot, time)
+        let blob = PrecomputedBlob {
+            sha: blob_sha,
+            compressed: compressed_blob,
+        };
+        self.commit_file(
+            path,
+            markdown,
+            blob,
+            message,
+            CommitPeople {
+                author: bot,
+                committer: bot,
+            },
+            time,
+        )
     }
 
     /// Commits a static repository file with the fixed initial authorship metadata.
@@ -326,12 +367,20 @@ impl BareRepoWriter {
             name: "Junghwan Park",
             email: "reserve.dev@gmail.com",
         };
+        let (blob_sha, compressed_blob) = precompute_blob(content);
+        let blob = PrecomputedBlob {
+            sha: blob_sha,
+            compressed: &compressed_blob,
+        };
         self.commit_file(
             path,
             content,
+            blob,
             &message,
-            author,
-            author,
+            CommitPeople {
+                author,
+                committer: author,
+            },
             GitTimestampKst { epoch },
         )
     }
@@ -401,9 +450,9 @@ impl BareRepoWriter {
         &mut self,
         path: &RepoPathBuf,
         content: &[u8],
+        blob: PrecomputedBlob<'_>,
         message: &str,
-        author: GitPerson<'_>,
-        committer: GitPerson<'_>,
+        people: CommitPeople<'_>,
         time: GitTimestampKst,
     ) -> Result<()> {
         // Warning: HOT PATH!
@@ -442,7 +491,6 @@ impl BareRepoWriter {
         //
         // Store the file body first, preferably as a delta against the previous revision.
         //
-        let blob_sha = git_hash(PackObjectKind::Blob.git_type_name(), content);
         if let Some(previous) = entry.previous_blob.as_ref() {
             let previous_len = previous.content.len();
             let current_len = content.len();
@@ -456,23 +504,38 @@ impl BareRepoWriter {
             // Skip expensive delta construction for cases that almost never compress well:
             // identical blobs, very small bodies, or revisions whose sizes diverged too much.
             //
-            if previous.sha != blob_sha && smaller >= 128 && larger <= smaller.saturating_mul(2) {
+            if previous.sha != blob.sha && smaller >= 128 && larger <= smaller.saturating_mul(2) {
                 let delta = create_delta(&previous.content, content);
                 if delta.len() < content.len() * 3 / 4 {
                     self.writer
-                        .write_ref_delta(previous.sha, &delta, blob_sha)?;
+                        .write_ref_delta(previous.sha, &delta, blob.sha)?;
                 } else {
-                    self.writer.write_object(PackObjectKind::Blob, content)?;
+                    self.writer.write_precompressed_object(
+                        PackObjectKind::Blob,
+                        content.len(),
+                        blob.sha,
+                        blob.compressed,
+                    )?;
                 }
             } else {
-                self.writer.write_object(PackObjectKind::Blob, content)?;
+                self.writer.write_precompressed_object(
+                    PackObjectKind::Blob,
+                    content.len(),
+                    blob.sha,
+                    blob.compressed,
+                )?;
             }
         } else {
-            self.writer.write_object(PackObjectKind::Blob, content)?;
+            self.writer.write_precompressed_object(
+                PackObjectKind::Blob,
+                content.len(),
+                blob.sha,
+                blob.compressed,
+            )?;
         }
-        entry.sha = blob_sha;
+        entry.sha = blob.sha;
         entry.previous_blob = Some(PreviousBlob {
-            sha: blob_sha,
+            sha: blob.sha,
             content: content.to_vec(),
         });
 
@@ -481,7 +544,8 @@ impl BareRepoWriter {
         //
         self.tree_dirty = true;
         let root_sha = self.root_tree_sha()?;
-        let commit_sha = self.write_commit(root_sha, message, author, committer, time)?;
+        let commit_sha =
+            self.write_commit(root_sha, message, people.author, people.committer, time)?;
         self.parent_commit = Some(commit_sha);
         Ok(())
     }
@@ -771,17 +835,7 @@ impl PackWriter {
         // Hash first so repeated trees/blobs/commits can be skipped entirely in the pack stream.
         //
         let sha = git_hash(object_type.git_type_name(), data);
-        if !self.seen.insert(sha) {
-            return Ok(sha);
-        }
-
-        //
-        // PACK object headers use a variable-length size encoding ahead of the compressed body.
-        //
-        self.write_pack_entry_header(object_type, data.len())?;
-        self.write_raw(&compress(data))?;
-        self.object_count += 1;
-        Ok(sha)
+        self.write_precompressed_object(object_type, data.len(), sha, &compress(data))
     }
 
     /// Appends one `REF_DELTA` object to the pack unless the result id already exists.
@@ -801,6 +855,27 @@ impl PackWriter {
         self.write_raw(&compress(delta))?;
         self.object_count += 1;
         Ok(result_sha)
+    }
+
+    /// Appends one full object whose object id and compressed payload were prepared earlier.
+    fn write_precompressed_object(
+        &mut self,
+        object_type: PackObjectKind,
+        size: usize,
+        sha: [u8; 20],
+        compressed: &[u8],
+    ) -> Result<[u8; 20]> {
+        if !self.seen.insert(sha) {
+            return Ok(sha);
+        }
+
+        //
+        // PACK object headers use a variable-length size encoding ahead of the compressed body.
+        //
+        self.write_pack_entry_header(object_type, size)?;
+        self.write_raw(compressed)?;
+        self.object_count += 1;
+        Ok(sha)
     }
 
     /// Writes the final pack header and trailer checksum around the buffered body stream.
@@ -1175,10 +1250,13 @@ mod tests {
     fn clamps_pre_epoch_dates() {
         let temp = TempDir::new().unwrap();
         let (output, mut writer) = new_writer(&temp);
+        let (blob_sha, compressed_blob) = precompute_blob(b"body");
         writer
             .commit_law(
                 &RepoPathBuf::kr_file("테스트법", "법률.md"),
                 b"body",
+                blob_sha,
+                &compressed_blob,
                 "message",
                 GitTimestampKst::from_promulgation_date("19491021").unwrap(),
             )
@@ -1213,9 +1291,12 @@ mod tests {
 
         let result = (|| -> Result<()> {
             let mut writer = BareRepoWriter::create(Path::new("output.git"))?;
+            let (blob_sha, compressed_blob) = precompute_blob(b"body");
             writer.commit_law(
                 &RepoPathBuf::kr_file("테스트법", "법률.md"),
                 b"body",
+                blob_sha,
+                &compressed_blob,
                 "message",
                 GitTimestampKst::from_promulgation_date("20240101")?,
             )?;
