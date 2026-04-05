@@ -146,6 +146,8 @@ struct Entry {
     sha: [u8; 20],
     /// Whether the target object is itself a tree.
     is_tree: bool,
+    /// Previous blob revision kept as a delta base for repeated file updates.
+    previous_blob: Option<PreviousBlob>,
 }
 
 /// Cached state for one `kr/<group>/` subtree.
@@ -242,9 +244,7 @@ pub struct BareRepoWriter {
     /// Root-tree cache and patch metadata.
     root: RootTreeState,
 
-    // Blob and subtree history that lets repeated law revisions reuse previous objects.
-    /// Previous blob bodies keyed by repository path.
-    prev_blobs: HashMap<RepoPathBuf, PreviousBlob>,
+    // Subtree history that lets repeated law revisions reuse previous objects.
     /// `kr/` subtree cache and patch metadata.
     kr: KrTreeState,
     /// Parent commit id for the next handcrafted commit object.
@@ -289,7 +289,6 @@ impl BareRepoWriter {
             temp_output,
             final_output,
             root: RootTreeState::default(),
-            prev_blobs: HashMap::default(),
             kr: KrTreeState::default(),
             parent_commit: None,
             tree_dirty: false,
@@ -409,11 +408,44 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestampKst,
     ) -> Result<()> {
+        // Warning: HOT PATH!
+
+        //
+        // Look up the touched file entry first so the previous blob body lives beside the tree
+        // entry itself instead of behind a second global hash map keyed by RepoPathBuf.
+        //
+        let entry = match path {
+            RepoPathBuf::RootFile(name) => {
+                let (index, inserted) = upsert(&mut self.root.files, name.as_bytes(), false);
+                if inserted {
+                    self.root.sha_offsets.clear();
+                    self.root.kr_sha_offset = None;
+                    self.root.dirty_entry = None;
+                } else {
+                    self.root.dirty_entry = Some(DirtyRootEntry::File(index));
+                }
+                self.kr.dirty_group_index = None;
+                &mut self.root.files[index]
+            }
+            RepoPathBuf::KrFile { group, filename } => {
+                let group_index = self.ensure_group(group.as_bytes());
+                let (index, _) = upsert(
+                    &mut self.kr.groups[group_index].files,
+                    filename.as_bytes(),
+                    false,
+                );
+                self.kr.groups[group_index].cached_sha = None;
+                self.kr.dirty_group_index = Some(group_index);
+                self.root.dirty_entry = Some(DirtyRootEntry::Kr);
+                &mut self.kr.groups[group_index].files[index]
+            }
+        };
+
         //
         // Store the file body first, preferably as a delta against the previous revision.
         //
         let blob_sha = git_hash(PackObjectKind::Blob.git_type_name(), content);
-        if let Some(previous) = self.prev_blobs.get(path) {
+        if let Some(previous) = entry.previous_blob.as_ref() {
             let previous_len = previous.content.len();
             let current_len = content.len();
             let (smaller, larger) = if previous_len <= current_len {
@@ -440,43 +472,11 @@ impl BareRepoWriter {
         } else {
             self.writer.write_object(PackObjectKind::Blob, content)?;
         }
-        self.prev_blobs.insert(
-            path.clone(),
-            PreviousBlob {
-                sha: blob_sha,
-                content: content.to_vec(),
-            },
-        );
-
-        //
-        // Update the logical tree state for either a root file or a kr/<group>/<file> leaf.
-        //
-        match path {
-            RepoPathBuf::RootFile(name) => {
-                let (index, inserted) =
-                    upsert(&mut self.root.files, name.as_bytes(), blob_sha, false);
-                if inserted {
-                    self.root.sha_offsets.clear();
-                    self.root.kr_sha_offset = None;
-                    self.root.dirty_entry = None;
-                } else {
-                    self.root.dirty_entry = Some(DirtyRootEntry::File(index));
-                }
-                self.kr.dirty_group_index = None;
-            }
-            RepoPathBuf::KrFile { group, filename } => {
-                let group_index = self.ensure_group(group.as_bytes());
-                upsert(
-                    &mut self.kr.groups[group_index].files,
-                    filename.as_bytes(),
-                    blob_sha,
-                    false,
-                );
-                self.kr.groups[group_index].cached_sha = None;
-                self.kr.dirty_group_index = Some(group_index);
-                self.root.dirty_entry = Some(DirtyRootEntry::Kr);
-            }
-        }
+        entry.sha = blob_sha;
+        entry.previous_blob = Some(PreviousBlob {
+            sha: blob_sha,
+            content: content.to_vec(),
+        });
 
         //
         // Materialize the current root tree and append the commit object in order.
@@ -943,21 +943,19 @@ fn remove_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Inserts or updates one sorted tree entry and returns its index plus insertion status.
-fn upsert(entries: &mut Vec<Entry>, name: &[u8], sha: [u8; 20], is_tree: bool) -> (usize, bool) {
+/// Inserts a sorted tree entry if needed and returns its index plus insertion status.
+fn upsert(entries: &mut Vec<Entry>, name: &[u8], is_tree: bool) -> (usize, bool) {
     match entries.iter().position(|entry| entry.name == name) {
-        Some(index) => {
-            entries[index].sha = sha;
-            (index, false)
-        }
+        Some(index) => (index, false),
         None => {
             let index = entries.partition_point(|entry| entry.name.as_slice() < name);
             entries.insert(
                 index,
                 Entry {
                     name: name.to_vec(),
-                    sha,
+                    sha: [0; 20],
                     is_tree,
+                    previous_blob: None,
                 },
             );
             (index, true)
