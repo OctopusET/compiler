@@ -581,7 +581,7 @@ impl BareRepoWriter {
 
     /// Materializes and returns the current root tree object id.
     fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
-        // NOTE: 46% of commit_file() runtime
+        // NOTE: 53% of commit_file() runtime
 
         //
         // Refresh only the dirty subtree in the steady state. Full group scans are only needed
@@ -798,7 +798,7 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestampKst,
     ) -> Result<[u8; 20]> {
-        // NOTE: 5.0% of commit_file() runtime
+        // NOTE: 5.6% of commit_file() runtime
 
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
         let mut commit = format!("tree {}\n", hex(&tree));
@@ -850,7 +850,7 @@ impl PackWriter {
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
-        // NOTE: 5.3% of commit_file() runtime
+        // NOTE: 6.4% of commit_file() runtime
 
         if !self.seen.insert(result_sha) {
             return Ok(result_sha);
@@ -1032,12 +1032,13 @@ fn compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("zlib finish on Vec cannot fail")
 }
 
+/// Fixed block width used by the blob delta matcher.
+const DELTA_BLOCK_SIZE: usize = 16;
+
 /// Builds a Git copy/insert delta from `src` to `dst`.
 #[inline(never)]
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
-    // NOTE: 41% of commit_file() runtime
-
-    let block_size = 16usize;
+    // NOTE: 33% of commit_file() runtime
 
     //
     // Index fixed-size source blocks so destination scanning can prefer copy commands.
@@ -1046,22 +1047,20 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
     encode_varint(&mut delta, src.len());
     encode_varint(&mut delta, dst.len());
 
-    if src.len() < block_size {
+    if src.len() < DELTA_BLOCK_SIZE {
         emit_inserts(&mut delta, dst);
         return delta;
     }
 
-    let source_block_count = src
-        .len()
-        .saturating_sub(block_size - 1)
-        .div_ceil(block_size);
-    let mut index = HashMap::<u32, SmallVec<[usize; 4]>>::with_capacity_and_hasher(
-        source_block_count,
-        Default::default(),
-    );
-    for source_offset in (0..src.len().saturating_sub(block_size - 1)).step_by(block_size) {
-        let hash = block_hash(&src[source_offset..source_offset + block_size]);
-        index.entry(hash).or_default().push(source_offset);
+    let (source_blocks, _) = src.as_chunks();
+    let source_block_count = source_blocks.len();
+    let mut index: HashMap<u32, SmallVec<[usize; 4]>> =
+        HashMap::with_capacity_and_hasher(source_block_count, Default::default());
+    for (block_index, block) in source_blocks.iter().enumerate() {
+        index
+            .entry(block_hash(block))
+            .or_default()
+            .push(block_index * DELTA_BLOCK_SIZE);
     }
 
     //
@@ -1073,10 +1072,9 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
     while destination_offset < dst.len() {
         let mut best_source_offset = 0usize;
         let mut best_len = 0usize;
-        let remaining = dst.len() - destination_offset;
 
-        if remaining >= block_size {
-            let hash = block_hash(&dst[destination_offset..destination_offset + block_size]);
+        if let Some(block) = dst[destination_offset..].first_chunk() {
+            let hash = block_hash(block);
             if let Some(candidates) = index.get(&hash) {
                 for &source_offset in candidates {
                     let match_len = match_length(src, source_offset, dst, destination_offset);
@@ -1088,7 +1086,7 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
             }
         }
 
-        if best_len >= block_size {
+        if best_len >= DELTA_BLOCK_SIZE {
             flush_inserts(&mut delta, &mut pending);
             emit_copy(&mut delta, best_source_offset, best_len);
             destination_offset += best_len;
@@ -1168,13 +1166,14 @@ fn emit_copy(out: &mut Vec<u8>, offset: usize, size: usize) {
 }
 
 /// Hashes one fixed-size block for delta index lookup.
-fn block_hash(data: &[u8]) -> u32 {
-    let mut hash = 0x811c9dc5u32;
-    for &byte in data {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    hash
+fn block_hash(data: &[u8; DELTA_BLOCK_SIZE]) -> u32 {
+    // This hash only drives candidate bucketing inside create_delta(). Collisions are harmless,
+    // so prefer a cheap fixed-width mix over a stronger byte-at-a-time hash.
+    let left = u64::from_ne_bytes(data[..8].try_into().unwrap());
+    let right = u64::from_ne_bytes(data[8..].try_into().unwrap());
+    let mixed = left.wrapping_mul(0x9e37_79b1_85eb_ca87)
+        ^ right.rotate_left(23).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    (mixed ^ (mixed >> 32)) as u32
 }
 
 /// Returns the byte length of the common run starting at the two offsets.
