@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use mimalloc::MiMalloc;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use serde::Deserialize;
@@ -28,6 +29,10 @@ use crate::xml_parser::{LawDetail, LawMetadata, parse_law_body, parse_metadata_o
 
 /// Bundled README payload for the synthetic initial commit.
 const REPOSITORY_README: &[u8] = include_bytes!("../assets/README.md");
+
+/// Global allocator tuned for high-throughput allocation-heavy pack generation.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 /// Command-line interface for one-shot cache compilation.
 #[derive(Debug, Parser)]
