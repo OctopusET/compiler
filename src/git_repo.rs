@@ -580,7 +580,7 @@ impl BareRepoWriter {
 
     /// Materializes and returns the current root tree object id.
     fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
-        // NOTE: 32% of commit_file() runtime
+        // NOTE: 39% of commit_file() runtime
 
         //
         // Refresh only the dirty subtree in the steady state. Full group scans are only needed
@@ -797,7 +797,7 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestampKst,
     ) -> Result<[u8; 20]> {
-        // NOTE: 3.3% of commit_file() runtime
+        // NOTE: 4.1% of commit_file() runtime
 
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
         let mut commit = format!("tree {}\n", hex(&tree));
@@ -849,7 +849,7 @@ impl PackWriter {
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
-        // NOTE: 4.0% of commit_file() runtime
+        // NOTE: 4.9% of commit_file() runtime
 
         if !self.seen.insert(result_sha) {
             return Ok(result_sha);
@@ -1034,7 +1034,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
 /// Builds a Git copy/insert delta from `src` to `dst`.
 #[inline(never)]
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
-    // NOTE: 60% of commit_file() runtime
+    // NOTE: 50% of commit_file() runtime
 
     let block_size = 16usize;
 
@@ -1050,10 +1050,20 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
         return delta;
     }
 
-    let mut index = HashMap::<u32, Vec<usize>>::default();
+    let source_block_count = src
+        .len()
+        .saturating_sub(block_size - 1)
+        .div_ceil(block_size);
+    let mut index = HashMap::<u32, Vec<usize>>::with_capacity_and_hasher(
+        source_block_count,
+        Default::default(),
+    );
     for source_offset in (0..src.len().saturating_sub(block_size - 1)).step_by(block_size) {
         let hash = block_hash(&src[source_offset..source_offset + block_size]);
-        index.entry(hash).or_default().push(source_offset);
+        index
+            .entry(hash)
+            .or_insert_with(|| Vec::with_capacity(16))
+            .push(source_offset);
     }
 
     //
