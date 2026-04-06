@@ -581,7 +581,7 @@ impl BareRepoWriter {
 
     /// Materializes and returns the current root tree object id.
     fn root_tree_sha(&mut self) -> Result<[u8; 20]> {
-        // NOTE: 53% of commit_file() runtime
+        // NOTE: 60% of commit_file() runtime
 
         //
         // Refresh only the dirty subtree in the steady state. Full group scans are only needed
@@ -798,7 +798,7 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestampKst,
     ) -> Result<[u8; 20]> {
-        // NOTE: 5.6% of commit_file() runtime
+        // NOTE: 6.8% of commit_file() runtime
 
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
         let mut commit = format!("tree {}\n", hex(&tree));
@@ -850,7 +850,7 @@ impl PackWriter {
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
-        // NOTE: 6.4% of commit_file() runtime
+        // NOTE: 7.5% of commit_file() runtime
 
         if !self.seen.insert(result_sha) {
             return Ok(result_sha);
@@ -1038,7 +1038,7 @@ const DELTA_BLOCK_SIZE: usize = 16;
 /// Builds a Git copy/insert delta from `src` to `dst`.
 #[inline(never)]
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
-    // NOTE: 33% of commit_file() runtime
+    // NOTE: 24% of commit_file() runtime
 
     //
     // Index fixed-size source blocks so destination scanning can prefer copy commands.
@@ -1077,7 +1077,7 @@ fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
             let hash = block_hash(block);
             if let Some(candidates) = index.get(&hash) {
                 for &source_offset in candidates {
-                    let match_len = match_length(src, source_offset, dst, destination_offset);
+                    let match_len = match_length(&src[source_offset..], &dst[destination_offset..]);
                     if match_len > best_len {
                         best_len = match_len;
                         best_source_offset = source_offset;
@@ -1177,10 +1177,31 @@ fn block_hash(data: &[u8; DELTA_BLOCK_SIZE]) -> u32 {
 }
 
 /// Returns the byte length of the common run starting at the two offsets.
-fn match_length(src: &[u8], src_offset: usize, dst: &[u8], dst_offset: usize) -> usize {
-    let max = std::cmp::min(src.len() - src_offset, dst.len() - dst_offset);
+#[inline(always)]
+fn match_length(src: &[u8], dst: &[u8]) -> usize {
+    const WORD_SIZE: usize = std::mem::size_of::<usize>();
+
+    let max = std::cmp::min(src.len(), dst.len());
+
     let mut len = 0usize;
-    while len < max && src[src_offset + len] == dst[dst_offset + len] {
+    while len + WORD_SIZE <= max {
+        let src_word = usize::from_ne_bytes(src[len..len + WORD_SIZE].try_into().unwrap());
+        let dst_word = usize::from_ne_bytes(dst[len..len + WORD_SIZE].try_into().unwrap());
+        if src_word == dst_word {
+            len += WORD_SIZE;
+            continue;
+        }
+
+        // Short-circuit
+        let mismatch = src_word ^ dst_word;
+        let mismatch_bits = if cfg!(target_endian = "little") {
+            mismatch.trailing_zeros()
+        } else {
+            mismatch.leading_zeros()
+        };
+        return len + (mismatch_bits as usize / 8);
+    }
+    while len < max && src[len] == dst[len] {
         len += 1;
     }
     len
