@@ -798,7 +798,7 @@ impl BareRepoWriter {
         committer: GitPerson<'_>,
         time: GitTimestampKst,
     ) -> Result<[u8; 20]> {
-        // NOTE: 6.8% of commit_file() runtime
+        // NOTE: 5.0% of commit_file() runtime
 
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
         let mut commit = String::with_capacity(1000);
@@ -845,7 +845,7 @@ impl PackWriter {
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
-        // NOTE: 14.4% = 6.9% (from root_tree_sha()) + 7.5% (from commit_file() directly) of
+        // NOTE: 12.1% = 5.1% (from root_tree_sha()) + 7.0% (from commit_file() directly) of
         // commit_file() runtime
 
         if !self.seen.insert(result_sha) {
@@ -1034,7 +1034,7 @@ const DELTA_BLOCK_SIZE: usize = 16;
 /// Builds a Git copy/insert delta from `src` to `dst`.
 #[inline(never)]
 fn create_delta(src: &[u8], dst: &[u8]) -> Vec<u8> {
-    // NOTE: 24% of commit_file() runtime
+    // NOTE: 26% of commit_file() runtime
 
     //
     // Index fixed-size source blocks so destination scanning can prefer copy commands.
