@@ -801,20 +801,15 @@ impl BareRepoWriter {
         // NOTE: 6.8% of commit_file() runtime
 
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
-        let mut commit = format!("tree {}\n", hex(&tree));
+        let mut commit = String::with_capacity(1000);
+        commit.push_str(&format!("tree {}\n", hex(&tree)));
         if let Some(parent) = self.parent_commit {
             commit.push_str(&format!("parent {}\n", hex(&parent)));
         }
         commit.push_str(&format!(
-            "author {} <{}> {} +0900\n",
-            author.name, author.email, time.epoch
+            "author {} <{}> {} +0900\ncommitter {} <{}> {} +0900\n\n{message}",
+            author.name, author.email, time.epoch, committer.name, committer.email, time.epoch
         ));
-        commit.push_str(&format!(
-            "committer {} <{}> {} +0900\n",
-            committer.name, committer.email, time.epoch
-        ));
-        commit.push('\n');
-        commit.push_str(message);
         self.writer
             .write_object(PackObjectKind::Commit, commit.as_bytes())
     }
