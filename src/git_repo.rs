@@ -850,7 +850,8 @@ impl PackWriter {
         delta: &[u8],
         result_sha: [u8; 20],
     ) -> Result<[u8; 20]> {
-        // NOTE: 7.5% of commit_file() runtime
+        // NOTE: 14.4% = 6.9% (from root_tree_sha()) + 7.5% (from commit_file() directly) of
+        // commit_file() runtime
 
         if !self.seen.insert(result_sha) {
             return Ok(result_sha);
