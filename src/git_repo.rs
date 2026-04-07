@@ -179,6 +179,10 @@ struct Group {
     files: Vec<Entry>,
     /// Most recently materialized subtree SHA.
     cached_sha: Option<[u8; 20]>,
+    /// Previous tree serialization kept as a delta base for repeated subtree updates.
+    prev_tree_bytes: Option<Vec<u8>>,
+    /// Object id of the previous subtree revision.
+    prev_tree_sha: Option<[u8; 20]>,
 }
 
 /// Previous blob revision kept as a possible delta base.
@@ -569,6 +573,8 @@ impl BareRepoWriter {
                 name: name.to_vec(),
                 files: Vec::new(),
                 cached_sha: None,
+                prev_tree_bytes: None,
+                prev_tree_sha: None,
             },
         );
         for index in self.kr.group_indices.values_mut() {
@@ -615,7 +621,21 @@ impl BareRepoWriter {
                     }
                     tree
                 };
-                let sha = self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                let sha = git_hash(PackObjectKind::Tree.git_type_name(), &tree);
+                if let (Some(prev_bytes), Some(prev_sha)) =
+                    (group.prev_tree_bytes.as_ref(), group.prev_tree_sha)
+                {
+                    let delta = create_delta(prev_bytes, &tree);
+                    if delta.len() < tree.len() * 3 / 4 {
+                        self.writer.write_ref_delta(prev_sha, &delta, sha)?;
+                    } else {
+                        self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                    }
+                } else {
+                    self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                }
+                group.prev_tree_bytes = Some(tree);
+                group.prev_tree_sha = Some(sha);
                 group.cached_sha = Some(sha);
             }
         } else if let Some(index) = self.kr.dirty_group_index
@@ -636,7 +656,21 @@ impl BareRepoWriter {
                 }
                 tree
             };
-            let sha = self.writer.write_object(PackObjectKind::Tree, &tree)?;
+            let sha = git_hash(PackObjectKind::Tree.git_type_name(), &tree);
+            if let (Some(prev_bytes), Some(prev_sha)) =
+                (group.prev_tree_bytes.as_ref(), group.prev_tree_sha)
+            {
+                let delta = create_delta(prev_bytes, &tree);
+                if delta.len() < tree.len() * 3 / 4 {
+                    self.writer.write_ref_delta(prev_sha, &delta, sha)?;
+                } else {
+                    self.writer.write_object(PackObjectKind::Tree, &tree)?;
+                }
+            } else {
+                self.writer.write_object(PackObjectKind::Tree, &tree)?;
+            }
+            group.prev_tree_bytes = Some(tree);
+            group.prev_tree_sha = Some(sha);
             group.cached_sha = Some(sha);
         }
 
@@ -652,24 +686,87 @@ impl BareRepoWriter {
             None
         } else {
             if self.kr.structure_dirty || self.kr.sha_offsets.len() != self.kr.groups.len() {
-                self.kr.cache.clear();
-                self.kr.sha_offsets.clear();
-                for group in &self.kr.groups {
-                    self.kr.cache.extend_from_slice(b"40000 ");
-                    self.kr.cache.extend_from_slice(&group.name);
-                    self.kr.cache.push(0);
-                    self.kr.sha_offsets.push(self.kr.cache.len());
-                    self.kr.cache.extend_from_slice(
-                        &group.cached_sha.context("missing cached subtree SHA")?,
-                    );
+                // Find which group was inserted (groups already has N+1, sha_offsets has N)
+                let old_len = self.kr.sha_offsets.len();
+                let new_group_pos = if self.kr.groups.len() == old_len + 1 {
+                    // Exactly one group was inserted; find it
+                    (0..self.kr.groups.len()).find(|&i| {
+                        i >= old_len || self.kr.sha_offsets.get(i).is_none()
+                            || self.kr.cache.get(self.kr.sha_offsets[i]..self.kr.sha_offsets[i] + 20)
+                                != Some(&self.kr.groups[i].cached_sha.unwrap_or([0; 20]))
+                    })
+                } else {
+                    None
+                };
+
+                let base_sha = self.kr.current_sha;
+                if let (Some(pos), Some(base_sha)) = (new_group_pos, base_sha) {
+                    // In-place splice: construct entry, insert into cache, emit tiny delta
+                    let group = &self.kr.groups[pos];
+                    let group_sha = group.cached_sha.context("missing cached subtree SHA")?;
+                    let mut entry = Vec::with_capacity(6 + group.name.len() + 1 + 20);
+                    entry.extend_from_slice(b"40000 ");
+                    entry.extend_from_slice(&group.name);
+                    entry.push(0);
+                    let sha_off_in_entry = entry.len();
+                    entry.extend_from_slice(&group_sha);
+
+                    let old_cache_len = self.kr.cache.len();
+                    let byte_pos = if pos > 0 && pos <= old_len {
+                        self.kr.sha_offsets[pos - 1] + 20
+                    } else if pos == 0 {
+                        0
+                    } else {
+                        old_cache_len
+                    };
+
+                    // Build delta BEFORE modifying cache
+                    let mut delta = Vec::with_capacity(64 + entry.len());
+                    encode_varint(&mut delta, old_cache_len);
+                    encode_varint(&mut delta, old_cache_len + entry.len());
+                    if byte_pos > 0 {
+                        emit_copy(&mut delta, 0, byte_pos);
+                    }
+                    emit_inserts(&mut delta, &entry);
+                    let tail = old_cache_len - byte_pos;
+                    if tail > 0 {
+                        emit_copy(&mut delta, byte_pos, tail);
+                    }
+
+                    // Splice entry into cache
+                    self.kr.cache.splice(byte_pos..byte_pos, entry.iter().copied());
+
+                    // Update sha_offsets
+                    let entry_len = entry.len();
+                    for off in self.kr.sha_offsets.iter_mut().skip(pos) {
+                        *off += entry_len;
+                    }
+                    self.kr.sha_offsets.insert(pos, byte_pos + sha_off_in_entry);
+
+                    let kr_tree_sha =
+                        git_hash(PackObjectKind::Tree.git_type_name(), &self.kr.cache);
+                    self.writer.write_ref_delta(base_sha, &delta, kr_tree_sha)?;
+                    self.kr.current_sha = Some(kr_tree_sha);
+                } else {
+                    // First time or multiple groups changed: full rebuild
+                    self.kr.cache.clear();
+                    self.kr.sha_offsets.clear();
+                    for group in &self.kr.groups {
+                        self.kr.cache.extend_from_slice(b"40000 ");
+                        self.kr.cache.extend_from_slice(&group.name);
+                        self.kr.cache.push(0);
+                        self.kr.sha_offsets.push(self.kr.cache.len());
+                        self.kr.cache.extend_from_slice(
+                            &group.cached_sha.context("missing cached subtree SHA")?,
+                        );
+                    }
+                    let kr_tree_sha = self.writer
+                        .write_object(PackObjectKind::Tree, &self.kr.cache)?;
+                    self.kr.current_sha = Some(kr_tree_sha);
                 }
                 self.kr.structure_dirty = false;
-                let kr_tree_sha = self
-                    .writer
-                    .write_object(PackObjectKind::Tree, &self.kr.cache)?;
-                self.kr.current_sha = Some(kr_tree_sha);
                 self.kr.dirty_group_index = None;
-                Some(kr_tree_sha)
+                self.kr.current_sha
             } else if let Some(index) = self.kr.dirty_group_index.take() {
                 let base_kr_tree_sha = self.kr.current_sha;
                 let sha_offset = self.kr.sha_offsets[index];
