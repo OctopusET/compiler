@@ -900,15 +900,22 @@ impl BareRepoWriter {
         // NOTE: 5.0% of commit_file() runtime
 
         // Commit objects stay full-text because they are tiny and must exactly match Git's format.
+        use std::fmt::Write as _;
         let mut commit = String::with_capacity(1000);
-        commit.push_str(&format!("tree {}\n", hex(&tree)));
+        let tree_hex = hex_buf(&tree);
+        let tree_hex_str = std::str::from_utf8(&tree_hex).unwrap();
+        write!(commit, "tree {tree_hex_str}\n").unwrap();
         if let Some(parent) = self.parent_commit {
-            commit.push_str(&format!("parent {}\n", hex(&parent)));
+            let parent_hex = hex_buf(&parent);
+            let parent_hex_str = std::str::from_utf8(&parent_hex).unwrap();
+            write!(commit, "parent {parent_hex_str}\n").unwrap();
         }
-        commit.push_str(&format!(
+        write!(
+            commit,
             "author {} <{}> {} +0900\ncommitter {} <{}> {} +0900\n\n{message}",
             author.name, author.email, time.epoch, committer.name, committer.email, time.epoch
-        ));
+        )
+        .unwrap();
         self.writer
             .write_object(PackObjectKind::Commit, commit.as_bytes())
     }
@@ -1464,14 +1471,21 @@ fn git_hash(type_name: &[u8], data: &[u8]) -> [u8; 20] {
     hasher.finalize().into()
 }
 
-/// Hex-encodes one object id for commit bodies and Git subprocess arguments.
-fn hex(sha: &[u8; 20]) -> String {
-    let mut encoded = String::with_capacity(40);
-    for byte in sha {
-        use std::fmt::Write as _;
-        write!(encoded, "{byte:02x}").expect("formatting into String cannot fail");
+/// Stack-based hex encoding for the commit write hot path (no heap allocation).
+fn hex_buf(sha: &[u8; 20]) -> [u8; 40] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 40];
+    for (i, &b) in sha.iter().enumerate() {
+        buf[i * 2] = HEX[(b >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(b & 0xf) as usize];
     }
-    encoded
+    buf
+}
+
+/// Hex-encodes one object id for refs, logging, and non-hot-path usage.
+fn hex(sha: &[u8; 20]) -> String {
+    let buf = hex_buf(sha);
+    String::from_utf8(buf.to_vec()).expect("hex digits are valid UTF-8")
 }
 
 #[cfg(test)]
